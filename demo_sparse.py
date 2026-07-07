@@ -1,6 +1,7 @@
 import os
 import argparse
 import pickle
+import cv2
 import mediapy as media
 import numpy as np
 import torch
@@ -67,6 +68,13 @@ def get_args_parser():
     parser.add_argument("--ckpt", type=str, default="checkpoints/densetrack3d.pth", help="checkpoint path")
     parser.add_argument("--video_path", type=str, default="demo_data/rollerblade", help="demo video path")
     parser.add_argument("--output_path", type=str, default="results/demo", help="output path")
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default=None,
+        help="optional object mask (image or .npy, nonzero=object) at the query frame. "
+        "If given, only grid query points inside the mask are tracked.",
+    )
     parser.add_argument(
         "--use_depthcrafter", action="store_true", help="whether to use depthcrafter as input videodepth"
     )
@@ -159,6 +167,27 @@ if __name__ == "__main__":
     video = torch.from_numpy(video).permute(0, 3, 1, 2).cuda()[None].float()
     videodepth = torch.from_numpy(videodepth).unsqueeze(1).cuda()[None].float()
 
+    # Optional object mask: restrict the query grid to points inside the mask, so
+    # only object points are tracked. The predictor resizes it to model resolution
+    # internally, so we just supply it at native (H, W) as a (B, 1, H, W) tensor.
+    segm_mask = None
+    if args.mask_path is not None:
+        if args.mask_path.endswith(".npy"):
+            mask = np.load(args.mask_path)
+        else:
+            mask = cv2.imread(args.mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise IOError(f"Failed to read mask: {args.mask_path}")
+        mask = np.asarray(mask)
+        if mask.ndim == 3:  # collapse RGB/RGBA to a single channel
+            mask = mask[..., :3].max(axis=-1)
+        H, W = video.shape[-2:]
+        if mask.shape != (H, W):
+            mask = cv2.resize(mask.astype(np.float32), (W, H), interpolation=cv2.INTER_NEAREST)
+        mask_bin = (mask > 0).astype(np.float32)
+        segm_mask = torch.from_numpy(mask_bin)[None, None].cuda()  # (1, 1, H, W)
+        print(f"Loaded object mask {args.mask_path}: {int(mask_bin.sum())} object pixels at {W}x{H}")
+
     print("Run SparseTrack3D")
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=args.use_fp16):
@@ -183,7 +212,7 @@ if __name__ == "__main__":
                 video,
                 videodepth,
                 queries=None,
-                segm_mask=None,
+                segm_mask=segm_mask,
                 grid_size=args.grid_size,
                 grid_query_frame=args.query_frame,
                 backward_tracking=backward_tracking,

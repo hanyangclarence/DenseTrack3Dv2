@@ -9,9 +9,16 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
+import logging
 import pickle
 import time
 from pathlib import Path
+from typing import Optional
+
+# viser's websocket server logs a full traceback for every stray/incomplete
+# connection (browser preconnects, the share proxy, port probes). These are
+# harmless and don't affect playback, so quiet the logger to stop the spam.
+logging.getLogger("websockets").setLevel(logging.CRITICAL)
 
 import cv2
 import imageio
@@ -28,11 +35,16 @@ from tqdm.auto import tqdm
 
 def main(
     filepath: str = "results/demo/yellow-duck/dense_3d_track.pkl",
+    video_path: Optional[str] = None,
+    mask_path: Optional[str] = None,
+    mask_reso: tuple = (384, 512),
     downsample_factor: int = 1,
     max_frames: int = 100,
     share: bool = True,
     port: int = 8080,
-    point_size: float = 0.02
+    point_size: float = 0.001,
+    min_depth: float = 0.0,
+    max_depth: float = 0.5,
 ) -> None:
     server = viser.ViserServer(port=port)
     if share:
@@ -40,13 +52,8 @@ def main(
 
     print("Loading frames!")
 
-
-    data_root = "demo_data/DAVIS_FULL/JPEGImages/480p/"
-    name = "soapbox"
-    result_root = "results/demo_3d_v7_pyr"
-
-    # trajs_data = np.load(data_path)
-    with open(os.path.join(result_root, name, "dense_3d_track.pkl"), "rb") as handle:
+    # Load the dense 3D tracks from the given pkl file.
+    with open(filepath, "rb") as handle:
         trajs_3d_dict = pickle.load(handle)
 
     coords = trajs_3d_dict["coords"].astype(np.float32)  # T N 3
@@ -58,15 +65,32 @@ def main(
     num_frames, num_points = coords.shape[:2]
     print(f"Num frames {num_frames}, Num points {num_points}")
 
-    # breakpoint()
+    # Optionally restrict to a first-frame object mask. A full pkl has one track
+    # per pixel of the model grid (mask_reso, row-major), so a mask resized
+    # (nearest) to that grid indexes straight onto the N axis.
+    if mask_path is not None:
+        H_m, W_m = mask_reso
+        if num_points != H_m * W_m:
+            raise ValueError(
+                f"pkl has {num_points} tracks but mask_reso {mask_reso} implies {H_m * W_m}. "
+                "This pkl was likely already masked, or produced at a different resolution."
+            )
+        mask = np.load(mask_path) if mask_path.endswith(".npy") else media.read_image(mask_path)
+        mask = np.asarray(mask)
+        if mask.ndim == 3:
+            mask = mask[..., :3].max(axis=-1)
+        mask_bin = (mask > 0).astype(np.uint8)
+        mask_model = cv2.resize(mask_bin, (W_m, H_m), interpolation=cv2.INTER_NEAREST).astype(bool)
+        keep = mask_model.reshape(-1)
+        coords, colors, vis = coords[:, keep], colors[keep], vis[:, keep]
+        num_points = coords.shape[1]
+        print(f"Applied object mask {mask_path}: {num_points} tracks kept")
 
-    filename = os.path.basename(filepath).split(".")[0]
-    # try:
-    #     video, videodepth = read_data("demo_data", filename)
-    # except:
-    #     video, videodepth = None, None
-
-    video, _ = read_data(data_root, name)
+    # Optionally load the source RGB video to show a camera frustum per frame.
+    if video_path is not None:
+        video, _ = read_data(full_path=video_path)
+    else:
+        video = None
     # Add playback UI.
     with server.gui.add_folder("Playback"):
         gui_timestep = server.gui.add_slider(
@@ -129,11 +153,16 @@ def main(
     for i in tqdm(range(num_frames)):
         frame_nodes.append(server.scene.add_frame(f"/frames/t{i}", show_axes=False))
 
+        # Keep only visible points whose depth (Z) is within [min_depth, max_depth].
+        # This drops the collapsed invalid-depth points that otherwise blow up the scene bounds.
+        z = coords[i][:, 2]
+        mask = (vis[i] > 0.5) & (z >= min_depth) & (z <= max_depth)
+
         # Place the point cloud in the frame.
         server.scene.add_point_cloud(
             name=f"/frames/t{i}/pos",
-            points=coords[i],
-            colors=colors,
+            points=coords[i][mask],
+            colors=colors[mask],
             point_size=point_size,
             point_shape="rounded",
             wxyz=(1.0, 0.0, 0.0, 0.0),

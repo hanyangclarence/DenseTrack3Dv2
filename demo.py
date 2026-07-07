@@ -1,6 +1,7 @@
 import os
 import argparse
 import pickle
+import cv2
 import mediapy as media
 import numpy as np
 import torch
@@ -64,6 +65,19 @@ def get_args_parser():
     parser.add_argument("--ckpt", type=str, default="checkpoints/densetrack3d.pth", help="checkpoint path")
     parser.add_argument("--video_path", type=str, default="demo_data/rollerblade", help="demo video path")
     parser.add_argument("--output_path", type=str, default="results/demo", help="output path")
+    parser.add_argument(
+        "--mask_path",
+        type=str,
+        default=None,
+        help="optional first-frame object mask (image or .npy, nonzero=object). "
+        "If given, only tracks whose query pixel falls inside the mask are kept.",
+    )
+    parser.add_argument(
+        "--keep_reappearing",
+        action="store_true",
+        help="by default, once a track is occluded it stays invalid for the rest of the video "
+        "(no flicker-back with an unreliable position); pass this to allow it to reappear",
+    )
     parser.add_argument(
         "--use_depthcrafter", action="store_true", help="whether to use depthcrafter as input videodepth"
     )
@@ -155,6 +169,16 @@ if __name__ == "__main__":
     video = torch.from_numpy(video).permute(0, 3, 1, 2).cuda()[None].float()
     videodepth = torch.from_numpy(videodepth).unsqueeze(1).cuda()[None].float()
 
+    # Use real camera intrinsics if provided (else the model falls back to a rough fx=fy=W guess).
+    # intrinsics.npy is a 3x3 K matrix for the native (unscaled) video resolution.
+    predefined_intrs = None
+    intr_path = os.path.join(args.video_path, "intrinsics.npy")
+    if os.path.exists(intr_path):
+        K = np.load(intr_path).astype(np.float32)
+        # convert_trajs_uvd_to_trajs_3d uses intr as a 2D (3,3) matrix in its einsum, so keep it 2D.
+        predefined_intrs = torch.from_numpy(K).cuda()  # (3, 3)
+        print(f"Loaded camera intrinsics from {intr_path}:\n{K}")
+
     vid_name = args.video_path.split("/")[-1]
     save_dir = os.path.join(args.output_path, vid_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -167,12 +191,44 @@ if __name__ == "__main__":
             video,
             videodepth,
             grid_query_frame=0,
-            use_efficient_global_attn=False
+            use_efficient_global_attn=False,
+            predefined_intrs=predefined_intrs,
         )
 
     trajs_3d_dict = {k: v[0].cpu().numpy() for k, v in out_dict["trajs_3d_dict"].items()}
 
-    
+    # First-occlusion cutoff: once a track goes invisible, keep it invisible for
+    # the rest of the video (cumulative-AND along time), so it won't flicker back
+    # with an unreliable predicted position. All tracks are seeded at frame 0 here.
+    if not args.keep_reappearing:
+        trajs_3d_dict["vis"] = np.logical_and.accumulate(trajs_3d_dict["vis"].astype(bool), axis=0)
+
+    # Optionally restrict to a first-frame object mask. The dense tracks are one
+    # per pixel of the model-resolution grid (model_resolution = (H_m, W_m)), in
+    # row-major order, so a mask resized (nearest) to (W_m, H_m) maps directly
+    # onto the track (N) axis. coords/vis are (T, N, ...); colors is (N, 3).
+    if args.mask_path is not None:
+        H_m, W_m = model.model_resolution  # (384, 512)
+        if args.mask_path.endswith(".npy"):
+            mask = np.load(args.mask_path)
+        else:
+            mask = media.read_image(args.mask_path)
+        mask = np.asarray(mask)
+        if mask.ndim == 3:  # collapse RGB/RGBA mask to a single channel
+            mask = mask[..., :3].max(axis=-1)
+        mask_bin = (mask > 0).astype(np.uint8)
+        mask_model = cv2.resize(mask_bin, (W_m, H_m), interpolation=cv2.INTER_NEAREST).astype(bool)
+        keep = mask_model.reshape(-1)  # (N,)
+        n_keep = int(keep.sum())
+        if n_keep == 0:
+            raise ValueError(f"Mask {args.mask_path} selects 0 pixels after resize to {(W_m, H_m)}.")
+        print(f"Applying object mask {args.mask_path}: keeping {n_keep}/{keep.shape[0]} tracks")
+        trajs_3d_dict = {
+            "coords": trajs_3d_dict["coords"][:, keep],  # (T, n_keep, 3)
+            "colors": trajs_3d_dict["colors"][keep],     # (n_keep, 3)
+            "vis": trajs_3d_dict["vis"][:, keep],        # (T, n_keep)
+        }
+
     with open(os.path.join(save_dir, f"dense_3d_track.pkl"), "wb") as handle:
         pickle.dump(trajs_3d_dict, handle, protocol=pickle.HIGHEST_PROTOCOL)
 

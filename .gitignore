@@ -19,3 +19,15 @@ core.*
 vis_results
 
 demo_data/*/*.npy
+
+# editor / IDE caches
+.vscode/
+
+# local ZED capture data (kept on disk, not committed)
+demo_data/zed_capture/
+
+# python / native build artifacts
+*.egg-info/
+build/
+*.so
+*.o
