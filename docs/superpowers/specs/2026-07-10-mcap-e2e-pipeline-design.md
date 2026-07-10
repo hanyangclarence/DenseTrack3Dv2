@@ -130,8 +130,10 @@ Add an additive depth loader; do not change tracking/merge/viz logic.
 Single bash entry point.
 
 - Required: `--mcap`, `--text-prompt`.
-- Passthrough to Stage 3: `--start-frame`, `--num-frames`, `--win`, `--stride`,
-  `--grid-size` (forwarded verbatim).
+- Always processes the whole capture from the first frame — the driver does NOT
+  expose `--start-frame`/`--num-frames`. (`track_windowed.py` keeps those args for
+  standalone use; the driver just omits them so they default to full-range.)
+- Passthrough to Stage 3: `--win`, `--stride`, `--grid-size` (forwarded verbatim).
 - `--output-dir` (default under `results/`).
 - Config variables at top: env names, Track4World repo path, SAM2/DINO checkpoints,
   intrinsics, depth-scale, fps.
