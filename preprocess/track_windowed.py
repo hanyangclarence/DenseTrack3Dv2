@@ -13,13 +13,26 @@ This uses the SPARSE tracker (demo_sparse.py's Predictor3D): a regular grid of
 only object points are ever tracked. Much faster than the dense per-pixel path,
 at the cost of fewer points (tune --grid-size for density).
 
-Each window is an independent predictor run. The 3D coords it returns are
-camera-centric per frame (xyz = K^-1 [u,v,1] * depth(t)), so a point at absolute
-frame t is in frame t's camera coordinates no matter which window produced it --
-merging is just placing each window's tracks at their absolute frame indices.
-There is NO cross-window identity stitching: a physical point seen in two windows
-becomes two tracks (this is intended -- it re-anchors against drift). The merge
-is a union, padded with NaN / vis=False outside each track's own window.
+The 3D coords a window returns are camera-centric per frame
+(xyz = K^-1 [u,v,1] * depth(t)), so a point at absolute frame t is in frame t's
+camera coordinates no matter which window produced it -- placing each window's
+tracks at their absolute frame indices is all the alignment needed.
+
+STITCHING (default, --stitch): to get long-horizon object flow (not per-window
+fragments), each window carries the immediately-previous window's still-visible
+object points forward as EXPLICIT queries. The predictor overwrites its prediction
+at the query frame with the exact query position, so a carried identity continues
+seam-free (no jump). Alongside them we seed FRESH grid points inside the mask that
+are not within --merge-radius px of a carried point, picking up new surface as the
+object rotates. Later windows overwrite the overlap, so each identity's value at
+frame t comes from the freshest window that re-anchored it -- long identities, yet
+each frame still sourced from a window seeded <= win frames earlier (bounded drift).
+Identities are unbounded in length. There is NO cross-track correspondence guessing:
+an identity is continued by injecting ITS OWN position, never by matching.
+
+UNION (--no-stitch): the original behavior -- each window is an independent run
+seeded by grid ∩ its start-mask, and results are concatenated with no identity
+linking (a physical point seen in two windows becomes two tracks). Kept for A/B.
 
 Output <out>/<name>/dense_3d_track.pkl is drop-in for both visualizers:
     coords (T, N, 3) float32  metric XYZ in metres; NaN where a track is inactive
@@ -51,6 +64,7 @@ from tqdm.auto import tqdm
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
+from densetrack3d.models.model_utils import get_points_on_a_grid
 from densetrack3d.models.predictor.predictor import Predictor3D
 
 # depth-video decode shares the exact codec definition used by the extractor
@@ -134,6 +148,28 @@ def parse_args():
         action="store_true",
         help="by default, once a track is occluded it stays invalid for the rest of its window "
         "(no flicker-back with an unreliable position); pass this to allow it to reappear",
+    )
+    p.add_argument(
+        "--stitch",
+        dest="stitch",
+        action="store_true",
+        default=True,
+        help="(default) carry each visible object point forward into the next window as an "
+        "explicit query, producing long seam-free identities instead of per-window fragments",
+    )
+    p.add_argument(
+        "--no-stitch",
+        dest="stitch",
+        action="store_false",
+        help="disable stitching: reproduce the pure-union behavior (each window an independent "
+        "set of tracks, concatenated) for A/B comparison",
+    )
+    p.add_argument(
+        "--merge-radius",
+        type=float,
+        default=-1.0,
+        help="dedup distance (native px) for new grid points vs carried-forward points; "
+        "a value < 0 uses one grid-cell spacing (~ W / grid_size)",
     )
     return p.parse_args()
 
@@ -229,6 +265,186 @@ def render_2d_overlay(video_np, uv, vis, colors, trace=8):
     return np.stack(frames)
 
 
+def _predict_window(predictor, gtimer, video_np, depth_np, s, e, K, keep_reappearing,
+                    queries=None, segm_mask=None, grid_size=0):
+    """Run the predictor on one window [s,e) and return native-resolution results.
+
+    Exactly one of `queries` (explicit (1,N,3) frame,x,y at native res) or
+    `segm_mask` (grid ∩ mask seeding) is used. Returns
+    (w_coords (Lw,n,3), w_colors (n,3), w_vis (Lw,n) bool, w_uv (Lw,n,2)) with the
+    first-occlusion cutoff already applied, or None if no query points survived.
+    """
+    with gtimer("h2d_transfer"):
+        vid_w = torch.from_numpy(video_np[s:e]).permute(0, 3, 1, 2).cuda()[None].float()  # (1,Lw,3,H,W)
+        dep_w = torch.from_numpy(depth_np[s:e]).unsqueeze(1).cuda()[None].float()          # (1,Lw,1,H,W)
+    with gtimer("predictor_total"):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
+            out = predictor(
+                vid_w,
+                dep_w,
+                queries=queries,
+                segm_mask=segm_mask,
+                grid_size=grid_size,
+                grid_query_frame=0,          # seed at this window's first frame
+                backward_tracking=False,     # windows only look forward from their start
+                predefined_intrs=K,
+            )
+    with gtimer("d2h_readback"):
+        d3d = {k: v[0].cpu().numpy() for k, v in out["trajs_3d_dict"].items()}
+        w_uv = out["trajs_uv"][0].cpu().numpy()  # (Lw, n, 2) native-resolution pixel coords
+    w_coords = d3d["coords"]          # (Lw, n, 3)
+    w_colors = d3d["colors"]          # (n, 3)
+    w_vis = d3d["vis"].astype(bool)   # (Lw, n)
+    if w_coords.shape[1] == 0:
+        return None
+    # First-occlusion cutoff (within this window): once a track goes invisible it
+    # stays invisible for the rest of its window (no flicker-back with a bad pos).
+    if not keep_reappearing:
+        w_vis = np.logical_and.accumulate(w_vis, axis=0)
+    return w_coords, w_colors.astype(np.float32), w_vis, w_uv
+
+
+def _run_windows_union(predictor, gtimer, windows, abs_frames, video_np, depth_np,
+                       mask_dir, K, H, W, T, grid_size, keep_reappearing):
+    """Original behavior: each window seeds grid ∩ its start-mask independently, and
+    the results are unioned along the track axis (no identity linking). Returns
+    stacked (coords, colors, vis, uv)."""
+    all_coords, all_colors, all_vis, all_uv = [], [], [], []
+    for wi, (s, e) in enumerate(windows):
+        abs_start = abs_frames[s]
+        Lw = e - s
+        print(f"\n[window {wi + 1}/{len(windows)}] local {s}:{e} (abs {abs_start}..{abs_frames[e - 1]}), {Lw} frames")
+
+        mask_path = os.path.join(mask_dir, f"{abs_start:05d}.png")
+        segm_mask, n_obj_px = load_segm_mask(mask_path, (H, W))
+        print(f"  seed mask {os.path.basename(mask_path)} ({n_obj_px} object px)")
+
+        res = _predict_window(predictor, gtimer, video_np, depth_np, s, e, K,
+                              keep_reappearing, queries=None, segm_mask=segm_mask, grid_size=grid_size)
+        if res is None:
+            print("  WARNING: no query points fell inside mask; skipping window")
+            continue
+        w_coords, w_colors, w_vis, w_uv = res
+        n_keep = w_coords.shape[1]
+        print(f"  tracked {n_keep} object points")
+
+        # place into full-length buffers: NaN coords / vis=False outside [s,e)
+        full_coords = np.full((T, n_keep, 3), np.nan, dtype=np.float32)
+        full_uv = np.full((T, n_keep, 2), np.nan, dtype=np.float32)
+        full_vis = np.zeros((T, n_keep), dtype=bool)
+        full_coords[s:e] = w_coords
+        full_uv[s:e] = w_uv
+        full_vis[s:e] = w_vis
+        all_coords.append(full_coords)
+        all_colors.append(w_colors)
+        all_vis.append(full_vis)
+        all_uv.append(full_uv)
+
+    if not all_coords:
+        raise RuntimeError("No windows produced tracks (all masks empty?).")
+    return (np.concatenate(all_coords, axis=1), np.concatenate(all_colors, axis=0),
+            np.concatenate(all_vis, axis=1), np.concatenate(all_uv, axis=1))
+
+
+def _run_windows_stitched(predictor, gtimer, windows, abs_frames, video_np, depth_np,
+                          mask_dir, K, H, W, T, grid_size, merge_radius, keep_reappearing):
+    """Carry-forward stitching (seam-free). Each window injects the immediately
+    previous window's still-visible object points as explicit queries (so those
+    identities continue exactly), plus fresh grid ∩ mask points that are not within
+    `merge_radius` px of a carried point (new surface as the object rotates). Later
+    windows overwrite the overlap, so each identity takes its value at every frame
+    from the freshest window that re-anchored it. Returns stacked (coords, colors,
+    vis, uv) with one long identity per column."""
+    # per-identity full-length buffers; identities are unbounded in length
+    id_coords, id_uv, id_vis, id_colors = [], [], [], []
+    prev_ids = []  # identity indices touched by the immediately previous window
+    # native-resolution query grid (x, y), matching the predictor's grid∩mask seeding
+    grid = get_points_on_a_grid(grid_size, (H, W)).cpu().numpy()[0]  # (G, 2) xy
+
+    for wi, (s, e) in enumerate(windows):
+        abs_start = abs_frames[s]
+        Lw = e - s
+        print(f"\n[window {wi + 1}/{len(windows)}] local {s}:{e} (abs {abs_start}..{abs_frames[e - 1]}), {Lw} frames")
+
+        # 1. carry-forward: previous-window identities visible AND with valid depth at seam frame s
+        dframe = depth_np[s]  # (H, W) metres, 0 = invalid
+        carried_ids, carried_xy = [], []
+        for pid in prev_ids:
+            if not id_vis[pid][s]:
+                continue
+            x, y = id_uv[pid][s]
+            if not np.isfinite(x):
+                continue
+            xi, yi = int(round(float(x))), int(round(float(y)))
+            if 0 <= xi < W and 0 <= yi < H and dframe[yi, xi] > 0:
+                carried_ids.append(pid)
+                carried_xy.append((x, y))
+        carried_xy = np.asarray(carried_xy, dtype=np.float32).reshape(-1, 2)
+
+        # 2. fresh grid ∩ this window's start-mask, deduped against carried points
+        mask_path = os.path.join(mask_dir, f"{abs_start:05d}.png")
+        segm_mask, n_obj_px = load_segm_mask(mask_path, (H, W))
+        mask_np = segm_mask[0, 0].detach().cpu().numpy()
+        gx = np.clip(np.round(grid[:, 0]).astype(int), 0, W - 1)
+        gy = np.clip(np.round(grid[:, 1]).astype(int), 0, H - 1)
+        fresh = grid[mask_np[gy, gx] > 0]  # (F, 2)
+        if carried_xy.shape[0] and fresh.shape[0]:
+            d = np.linalg.norm(fresh[:, None, :] - carried_xy[None, :, :], axis=2)  # (F, C)
+            fresh = fresh[d.min(axis=1) > merge_radius]
+        n_car, n_fresh = carried_xy.shape[0], fresh.shape[0]
+        print(f"  seed mask {os.path.basename(mask_path)} ({n_obj_px} object px): "
+              f"{n_car} carried + {n_fresh} new queries")
+
+        if n_car + n_fresh == 0:
+            print("  WARNING: no carried and no in-mask points; skipping window")
+            prev_ids = []
+            continue
+
+        # 3. explicit queries [carried ; fresh] at local frame 0 (native px)
+        q_xy = np.concatenate([carried_xy, fresh], axis=0) if (n_car and n_fresh) else (carried_xy if n_car else fresh)
+        queries = torch.zeros((1, q_xy.shape[0], 3), dtype=torch.float32)
+        queries[0, :, 1] = torch.from_numpy(np.ascontiguousarray(q_xy[:, 0]))
+        queries[0, :, 2] = torch.from_numpy(np.ascontiguousarray(q_xy[:, 1]))
+        queries = queries.cuda()
+
+        res = _predict_window(predictor, gtimer, video_np, depth_np, s, e, K,
+                              keep_reappearing, queries=queries, segm_mask=None, grid_size=0)
+        if res is None:
+            print("  WARNING: predictor returned no tracks; skipping window")
+            prev_ids = []
+            continue
+        w_coords, w_colors, w_vis, w_uv = res  # columns ordered [carried ; fresh]
+
+        # 4a. carried columns extend existing identities (overwrite overlap: freshest wins)
+        cur_ids = []
+        for j, pid in enumerate(carried_ids):
+            id_coords[pid][s:e] = w_coords[:, j]
+            id_uv[pid][s:e] = w_uv[:, j]
+            id_vis[pid][s:e] = w_vis[:, j]
+            cur_ids.append(pid)  # color kept from the identity's first seed frame
+        # 4b. fresh columns create new identities
+        for j in range(n_fresh):
+            col = n_car + j
+            c = np.full((T, 3), np.nan, dtype=np.float32)
+            u = np.full((T, 2), np.nan, dtype=np.float32)
+            v = np.zeros((T,), dtype=bool)
+            c[s:e] = w_coords[:, col]
+            u[s:e] = w_uv[:, col]
+            v[s:e] = w_vis[:, col]
+            id_coords.append(c)
+            id_uv.append(u)
+            id_vis.append(v)
+            id_colors.append(w_colors[col])
+            cur_ids.append(len(id_coords) - 1)
+        print(f"  {n_car} carried + {n_fresh} new = {len(cur_ids)} identities live through this window")
+        prev_ids = cur_ids
+
+    if not id_coords:
+        raise RuntimeError("No windows produced tracks (all masks empty?).")
+    return (np.stack(id_coords, axis=1), np.stack(id_colors, axis=0),
+            np.stack(id_vis, axis=1), np.stack(id_uv, axis=1))
+
+
 def main():
     args = parse_args()
 
@@ -310,68 +526,21 @@ def main():
           + ", ".join(f"{abs_frames[s]}-{abs_frames[e-1]}" for s, e in windows))
 
     # --- run each window ----------------------------------------------------
-    # Accumulators: each track gets a full-length (T,...) buffer, active only in its window.
-    all_coords, all_colors, all_vis, all_uv = [], [], [], []
-    for wi, (s, e) in enumerate(windows):
-        abs_start = abs_frames[s]
-        Lw = e - s
-        print(f"\n[window {wi + 1}/{len(windows)}] local {s}:{e} (abs {abs_start}..{abs_frames[e - 1]}), {Lw} frames")
-
-        # host->device transfer of this window's RGB + depth
-        with gtimer("h2d_transfer"):
-            vid_w = torch.from_numpy(video_np[s:e]).permute(0, 3, 1, 2).cuda()[None].float()   # (1,Lw,3,H,W)
-            dep_w = torch.from_numpy(depth_np[s:e]).unsqueeze(1).cuda()[None].float()          # (1,Lw,1,H,W)
-
-        # seed mask: this window's start-frame mask, restricting the query grid to the object
-        mask_path = os.path.join(args.mask_dir, f"{abs_start:05d}.png")
-        segm_mask, n_obj_px = load_segm_mask(mask_path, (H, W))
-        print(f"  seed mask {os.path.basename(mask_path)} ({n_obj_px} object px)")
-
-        # full predictor call (includes model.extract_features, timed separately via the wrapper)
-        with gtimer("predictor_total"):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=False):
-                out = predictor(
-                    vid_w,
-                    dep_w,
-                    queries=None,
-                    segm_mask=segm_mask,
-                    grid_size=args.grid_size,
-                    grid_query_frame=0,          # seed at this window's first frame
-                    backward_tracking=False,     # windows only look forward from their start
-                    predefined_intrs=K,
-                )
-        # device->host readback of the results
-        with gtimer("d2h_readback"):
-            d3d = {k: v[0].cpu().numpy() for k, v in out["trajs_3d_dict"].items()}
-            w_uv = out["trajs_uv"][0].cpu().numpy()  # (Lw, n, 2) native-resolution pixel coords
-        w_coords = d3d["coords"]   # (Lw, n, 3)
-        w_colors = d3d["colors"]   # (n, 3)
-        w_vis = d3d["vis"].astype(bool)  # (Lw, n)
-        n_keep = w_coords.shape[1]
-        if n_keep == 0:
-            print(f"  WARNING: no query points fell inside mask; skipping window")
-            continue
-        print(f"  tracked {n_keep} object points")
-
-        # First-occlusion cutoff (within this window, before padding): once a track
-        # goes invisible it stays invisible for the rest of its window.
-        if not args.keep_reappearing:
-            w_vis = np.logical_and.accumulate(w_vis, axis=0)
-
-        # place into full-length buffers: NaN coords / vis=False outside [s,e)
-        full_coords = np.full((T, n_keep, 3), np.nan, dtype=np.float32)
-        full_uv = np.full((T, n_keep, 2), np.nan, dtype=np.float32)
-        full_vis = np.zeros((T, n_keep), dtype=bool)
-        full_coords[s:e] = w_coords
-        full_uv[s:e] = w_uv
-        full_vis[s:e] = w_vis
-        all_coords.append(full_coords)
-        all_colors.append(w_colors.astype(np.float32))
-        all_vis.append(full_vis)
-        all_uv.append(full_uv)
-
-    if not all_coords:
-        raise RuntimeError("No windows produced tracks (all masks empty?).")
+    # Stitched (default): carry each still-visible object point forward as an explicit
+    # query so its identity continues seam-free, plus fresh grid∩mask points for new
+    # surface -> long identities. Union (--no-stitch): the original independent-window
+    # concatenation. Both return (coords, colors, vis, uv) at native resolution.
+    if args.stitch:
+        merge_radius = args.merge_radius if args.merge_radius >= 0 else (W / max(args.grid_size, 1))
+        print(f"Stitching ON (merge-radius {merge_radius:.1f} px): carry-forward identities")
+        coords, colors, vis, uv = _run_windows_stitched(
+            predictor, gtimer, windows, abs_frames, video_np, depth_np, args.mask_dir,
+            K, H, W, T, args.grid_size, merge_radius, args.keep_reappearing)
+    else:
+        print("Stitching OFF (--no-stitch): pure per-window union")
+        coords, colors, vis, uv = _run_windows_union(
+            predictor, gtimer, windows, abs_frames, video_np, depth_np, args.mask_dir,
+            K, H, W, T, args.grid_size, args.keep_reappearing)
 
     # --- timing summary -----------------------------------------------------
     # predictor_total is the per-window "detection" cost; model.extract_features
@@ -384,11 +553,6 @@ def main():
         print(f"  -> per-frame tracking (predictor / win={args.win}): "
               f"{mean_win / args.win:.2f} ms/frame ({1000.0 * args.win / mean_win:.1f} frames/s within a window)")
 
-    # --- merge (union along the track axis) ---------------------------------
-    coords = np.concatenate(all_coords, axis=1)  # (T, N_total, 3)
-    colors = np.concatenate(all_colors, axis=0)  # (N_total, 3)
-    vis = np.concatenate(all_vis, axis=1)         # (T, N_total)
-    uv = np.concatenate(all_uv, axis=1)           # (T, N_total, 2)
     print(f"\nMerged: {coords.shape[1]} tracks over {T} frames "
           f"(~{coords.nbytes / 1e6:.0f} MB coords)")
 
