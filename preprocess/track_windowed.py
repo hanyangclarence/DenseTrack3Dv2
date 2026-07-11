@@ -53,6 +53,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from densetrack3d.models.densetrack3d.densetrack3dv2 import DenseTrack3DV2
 from densetrack3d.models.predictor.predictor import Predictor3D
 
+# depth-video decode shares the exact codec definition used by the extractor
+from preprocess.extract_mcap_rgbd import read_depth_video
+
 device = torch.device("cuda")
 
 
@@ -122,7 +125,7 @@ def parse_args():
     p.add_argument("--intrinsics", default="771.59,771.365,645.555,349.653", help="fx,fy,cx,cy at native res")
     p.add_argument("--depth-scale", type=float, default=1000.0, help="divide raw depth by this to get metres")
     p.add_argument("--start-frame", type=int, default=0, help="first absolute frame to process")
-    p.add_argument("--num-frames", type=int, default=400, help="number of frames to process from start-frame")
+    p.add_argument("--num-frames", type=int, default=400, help="number of frames to process from start-frame; a value < 0 means process to the end")
     p.add_argument("--win", type=int, default=30, help="window length in frames")
     p.add_argument("--stride", type=int, default=20, help="window start step (overlap = win - stride)")
     p.add_argument("--grid-size", type=int, default=80, help="sparse query grid side; more = denser object sampling")
@@ -232,11 +235,17 @@ def main():
     # --- load all frames + build metric depth stack once --------------------
     print(f"Loading color from {args.video}")
     color_frames = load_color_frames(args.video)
-    depth_files = sorted(glob.glob(os.path.join(args.depth, "*.png")))
-    if not depth_files:
-        raise FileNotFoundError(f"No .png depth frames in {args.depth}")
-    n_avail = min(len(color_frames), len(depth_files))
-    end = min(args.start_frame + args.num_frames, n_avail)
+    depth_is_video = os.path.isfile(args.depth) and args.depth.lower().endswith((".mkv", ".mp4"))
+    if depth_is_video:
+        depth_all = read_depth_video(args.depth)          # (T_all, H, W) uint16 mm
+        n_depth = depth_all.shape[0]
+    else:
+        depth_files = sorted(glob.glob(os.path.join(args.depth, "*.png")))
+        if not depth_files:
+            raise FileNotFoundError(f"No .png depth frames in {args.depth}")
+        n_depth = len(depth_files)
+    n_avail = min(len(color_frames), n_depth)
+    end = n_avail if args.num_frames < 0 else min(args.start_frame + args.num_frames, n_avail)
     abs_frames = list(range(args.start_frame, end))
     T = len(abs_frames)
     if T == 0:
@@ -252,7 +261,7 @@ def main():
     for f in abs_frames:
         bgr = color_frames[f]
         rgb_list.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
-        d_mm = cv2.imread(depth_files[f], cv2.IMREAD_ANYDEPTH)
+        d_mm = depth_all[f] if depth_is_video else cv2.imread(depth_files[f], cv2.IMREAD_ANYDEPTH)
         d_m = d_mm.astype(np.float32) / args.depth_scale  # zeros stay 0 (invalid)
         h, w = bgr.shape[:2]
         if d_m.shape != (h, w):

@@ -131,8 +131,10 @@ Single bash entry point.
 
 - Required: `--mcap`, `--text-prompt`.
 - Always processes the whole capture from the first frame — the driver does NOT
-  expose `--start-frame`/`--num-frames`. (`track_windowed.py` keeps those args for
-  standalone use; the driver just omits them so they default to full-range.)
+  expose `--start-frame`/`--num-frames`, and passes `--num-frames -1` (full-range
+  sentinel) to Stage 3. (`track_windowed.py` keeps those args for standalone use;
+  its standalone `--num-frames` default is 400, so the driver must pass the `-1`
+  sentinel explicitly to avoid silently truncating captures longer than 400 frames.)
 - Passthrough to Stage 3: `--win`, `--stride`, `--grid-size` (forwarded verbatim).
 - `--output-dir` (default under `results/`).
 - Config variables at top: env names, Track4World repo path, SAM2/DINO checkpoints,

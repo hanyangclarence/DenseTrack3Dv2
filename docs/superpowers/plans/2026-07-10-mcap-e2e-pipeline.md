@@ -516,7 +516,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Stage 1 extractor (mcap→color.mp4+depth.mkv, nearest-ts pairing, NaN→0, mm uint16, FFV1) → Task 1. ✓
 - Lossless depth video via raw ffmpeg pipe, shared codec helpers → Task 1 (`write/read_depth_video`). ✓
 - Stage 3 additive depth-video loader, PNG fallback, frame indexing intact → Task 2. ✓
-- Driver: required `--mcap`/`--text-prompt`, full-range (no start/num-frame args), `--win/--stride/--grid-size` passthrough, two envs via `conda run`, skip-if-exists + `--force`, banners, `set -euo pipefail` → Task 3. ✓
+- Driver: required `--mcap`/`--text-prompt`, full-range (passes `--num-frames -1` sentinel to Stage 3, since the tracker's standalone default is 400), `--win/--stride/--grid-size` passthrough, two envs via `conda run`, skip-if-exists + `--force`, banners, `set -euo pipefail` → Task 3. ✓
 - Masks/seg deleted unconditionally after Stage 3 success → Task 3 Step 1 (`rm -rf "$OUTDIR/seg"` after the tracking block). ✓
 - No per-frame depth files ever written → depth lives only in `depth.mkv`, decoded in-memory (Tasks 1–2). ✓
 - Verification: extractor standalone, round-trip, full pipeline, tracker parity → Task 1 Steps 3–4, Task 2 Step 3, Task 3 Step 4. ✓
