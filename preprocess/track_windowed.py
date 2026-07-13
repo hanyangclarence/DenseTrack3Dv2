@@ -57,7 +57,6 @@ import matplotlib.pyplot as plt
 import mediapy as media
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
 from tqdm.auto import tqdm
 
 # allow running from anywhere: repo root is the parent of preprocess/
@@ -237,32 +236,36 @@ def rainbow_colors_by_position(uv, vis):
 
 
 def render_2d_overlay(video_np, uv, vis, colors, trace=8):
-    """Draw merged 2D tracks over the RGB frames.
+    """Draw merged 2D tracks over the RGB frames (rainbow points + short trails).
 
     video_np (T,H,W,3) uint8 RGB; uv (T,N,2) pixel coords (NaN where inactive);
-    vis (T,N) bool; colors (N,3) 0-255. A point/segment is drawn only where vis
-    is True, so NaN-padded out-of-window frames are skipped. Returns (T,H,W,3).
+    vis (T,N) bool; colors (N,3) 0-255. A point/segment is drawn only where vis is
+    True AND its coords are finite, so NaN-padded out-of-window frames are skipped.
+    Returns (T,H,W,3).
+
+    Drawn with OpenCV primitives (cv2.line/circle) in place, not PIL: only the few
+    points visible in each frame are touched, so this stays fast on long clips
+    (~1600 frames) where per-point PIL ImageDraw calls were the dominant cost.
     """
     T, N = vis.shape
     colors = colors.astype(np.uint8)
-    frames = []
+    out = np.empty_like(video_np)
     for t in tqdm(range(T), desc="Rendering 2D overlay"):
-        img = Image.fromarray(video_np[t].copy())
-        draw = ImageDraw.Draw(img)
+        img = np.ascontiguousarray(video_np[t])
         # trailing lines: connect consecutive frames where both ends are visible
-        if trace > 0:
-            for t0 in range(max(0, t - trace), t):
-                seg_ok = vis[t0] & vis[t0 + 1]
-                for i in np.where(seg_ok)[0]:
-                    p0, p1 = uv[t0, i], uv[t0 + 1, i]
-                    draw.line([p0[0], p0[1], p1[0], p1[1]], fill=tuple(int(c) for c in colors[i]), width=1)
+        for t0 in range(max(0, t - trace), t):
+            for i in np.where(vis[t0] & vis[t0 + 1])[0]:
+                p0, p1 = uv[t0, i], uv[t0 + 1, i]
+                if np.isfinite(p0).all() and np.isfinite(p1).all():
+                    cv2.line(img, (int(p0[0]), int(p0[1])), (int(p1[0]), int(p1[1])),
+                             tuple(int(c) for c in colors[i]), 1, cv2.LINE_AA)
         # points at the current frame
         for i in np.where(vis[t])[0]:
-            x, y = float(uv[t, i, 0]), float(uv[t, i, 1])
-            c = tuple(int(v) for v in colors[i])
-            draw.ellipse([x - 2, y - 2, x + 2, y + 2], fill=c, outline=c)
-        frames.append(np.asarray(img))
-    return np.stack(frames)
+            x, y = uv[t, i]
+            if np.isfinite(x) and np.isfinite(y):
+                cv2.circle(img, (int(x), int(y)), 2, tuple(int(c) for c in colors[i]), -1, cv2.LINE_AA)
+        out[t] = img
+    return out
 
 
 def _predict_window(predictor, gtimer, video_np, depth_np, s, e, K, keep_reappearing,

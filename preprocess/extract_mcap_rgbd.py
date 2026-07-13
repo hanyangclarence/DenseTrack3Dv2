@@ -2,8 +2,15 @@
 """Extract ZED RGB-D from a ROS 2 mcap into compact, training-ready artifacts.
 
 Reads two topics from an mcap recording and writes:
-    <output-dir>/color.mp4   RGB (JPEG frames re-encoded to mp4)
-    <output-dir>/depth.mkv   16-bit millimetre depth, FFV1 / gray16le (LOSSLESS)
+    <output-dir>/color.mp4      RGB (JPEG frames re-encoded to mp4)
+    <output-dir>/depth.mkv      16-bit millimetre depth, FFV1 / gray16le (LOSSLESS)
+    <output-dir>/intrinsics.txt effective fx,fy,cx,cy for the written frames (if --intrinsics given)
+
+With --crop-width, color and depth are horizontally center-cropped to that width
+(full height kept) so every downstream stage sees only the interaction region. A
+horizontal crop shifts the principal point: cx' = cx - x0 (x0 = (W - Wc)//2), while
+fx, fy, cy are unchanged. We record the effective fx,fy,cx',cy in intrinsics.txt so
+tracking/smoothing unproject correctly -- crop and intrinsics stay co-located here.
 
 Depth in the mcap is 32FC1 (float32 metres, NaN/inf = invalid). We convert to
 uint16 millimetres (invalid -> 0) and store it as a lossless video. This is far
@@ -72,6 +79,12 @@ def parse_args():
     p.add_argument("--depth-topic", default="/dag/zed/depth")
     p.add_argument("--depth-scale", type=float, default=1000.0, help="metres -> raw units (1000 = mm)")
     p.add_argument("--fps", type=float, default=7.5)
+    p.add_argument("--crop-width", type=int, default=0,
+                   help="horizontally center-crop color+depth to this width, keeping full "
+                        "height (0 or >= source width = no crop)")
+    p.add_argument("--intrinsics", default=None,
+                   help="fx,fy,cx,cy at source resolution; if given, the crop-adjusted "
+                        "fx,fy,cx-x0,cy is written to <output-dir>/intrinsics.txt")
     return p.parse_args()
 
 
@@ -103,6 +116,7 @@ def main():
     depth_path = os.path.join(args.output_dir, "depth.mkv")
 
     H = W = None
+    Wc = x0 = None       # cropped width and left offset (set on first frame)
     writer = None
     depth_frames = []
     max_off_ms = 0.0
@@ -110,8 +124,13 @@ def main():
         bgr = cv2.imdecode(np.frombuffer(rgb.data, np.uint8), cv2.IMREAD_COLOR)
         if H is None:
             H, W = bgr.shape[:2]
-            writer = cv2.VideoWriter(color_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (W, H))
-        writer.write(bgr)
+            # horizontal center-crop: keep full height, take Wc px from the middle
+            Wc = W if args.crop_width <= 0 or args.crop_width >= W else args.crop_width
+            x0 = (W - Wc) // 2
+            writer = cv2.VideoWriter(color_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (Wc, H))
+            if Wc != W:
+                print(f"Cropping width {W} -> {Wc} (x0={x0}), height {H} kept")
+        writer.write(bgr[:, x0:x0 + Wc])
 
         j = int(np.argmin(np.abs(dep_ts - ts)))
         max_off_ms = max(max_off_ms, abs(dep_ts[j] - ts) / 1e6)
@@ -121,15 +140,24 @@ def main():
         if (dmsg.height, dmsg.width) != (H, W):
             d_m = cv2.resize(d_m, (W, H), interpolation=cv2.INTER_NEAREST)
         d_mm = np.clip(d_m * args.depth_scale, 0, 65535).astype(np.uint16)
-        depth_frames.append(d_mm)
+        depth_frames.append(d_mm[:, x0:x0 + Wc])   # crop identically to color
     writer.release()
 
-    write_depth_video(depth_path, depth_frames, H, W, args.fps)
+    write_depth_video(depth_path, depth_frames, H, Wc, args.fps)
+
+    # effective intrinsics for the (possibly cropped) frames: only cx shifts by x0
+    if args.intrinsics is not None:
+        fx, fy, cx, cy = (float(v) for v in args.intrinsics.split(","))
+        cx_eff = cx - x0
+        intr_path = os.path.join(args.output_dir, "intrinsics.txt")
+        with open(intr_path, "w") as f:
+            f.write(f"{fx},{fy},{cx_eff},{cy}\n")
+        print(f"Wrote {intr_path}: fx,fy,cx',cy = {fx},{fy},{cx_eff},{cy} (cx {cx} - x0 {x0})")
 
     stack = np.stack(depth_frames)
     valid = stack > 0
     print(
-        f"Wrote {len(depth_frames)} frames at {W}x{H}, {args.fps} fps\n"
+        f"Wrote {len(depth_frames)} frames at {Wc}x{H}, {args.fps} fps\n"
         f"  color.mp4 {os.path.getsize(color_path)/1e6:.1f} MB\n"
         f"  depth.mkv {os.path.getsize(depth_path)/1e6:.1f} MB "
         f"(valid depth {100*valid.mean():.1f}%, "
