@@ -170,6 +170,8 @@ def parse_args():
         help="dedup distance (native px) for new grid points vs carried-forward points; "
         "a value < 0 uses one grid-cell spacing (~ W / grid_size)",
     )
+    p.add_argument("--no-viz", action="store_true",
+                   help="skip the 2D overlay video (tracks_2d.mp4); still writes the pkl")
     return p.parse_args()
 
 
@@ -569,11 +571,14 @@ def main():
     # --- 2D overlay video ---------------------------------------------------
     # rainbow colors (keyed by seed-frame position) read best against the object;
     # 8-frame trailing line, 10 fps.
-    viz_colors = rainbow_colors_by_position(uv, vis)
-    vid_out = render_2d_overlay(video_np, uv, vis, viz_colors, trace=8)
-    mp4_path = os.path.join(save_dir, "tracks_2d.mp4")
-    media.write_video(mp4_path, vid_out, fps=10)
-    print(f"Saved {mp4_path}")
+    if args.no_viz:
+        print("Skipping 2D overlay video (--no-viz)")
+    else:
+        viz_colors = rainbow_colors_by_position(uv, vis)
+        vid_out = render_2d_overlay(video_np, uv, vis, viz_colors, trace=8)
+        mp4_path = os.path.join(save_dir, "tracks_2d.mp4")
+        media.write_video(mp4_path, vid_out, fps=10)
+        print(f"Saved {mp4_path}")
 
 
 if __name__ == "__main__":

@@ -113,6 +113,10 @@ def parse_args():
     p.add_argument("--reject-resid-k", type=float, default=6.0,
                    help="drop tracks whose rigid-motion residual exceeds median + k*MAD (shape-agnostic)")
     p.add_argument("--no-reject", action="store_true", help="keep all tracks (skip outlier rejection)")
+    p.add_argument("--output-name", default="dense_3d_track",
+                   help="output stem: writes <output-path>/<name>.pkl and <name>_2d.mp4")
+    p.add_argument("--no-viz", action="store_true",
+                   help="skip the 2D overlay video; still writes the smoothed pkl")
     return p.parse_args()
 
 
@@ -150,19 +154,22 @@ def main():
           f"(shake cut {(1 - tr_sm / max(tr_raw, 1e-9)) * 100:.0f}%)")
 
     os.makedirs(args.output_path, exist_ok=True)
-    out_pkl = os.path.join(args.output_path, "dense_3d_track.pkl")
+    out_pkl = os.path.join(args.output_path, f"{args.output_name}.pkl")
     with open(out_pkl, "wb") as h:
         pickle.dump({"coords": coords_sm, "colors": colors, "vis": vis_keep}, h,
                     protocol=pickle.HIGHEST_PROTOCOL)
     print(f"Saved {out_pkl}")
 
+    if args.no_viz:
+        print("Skipping 2D overlay video (--no-viz)")
+        return
     W, H = (int(x) for x in args.image_size.split(","))
     bg = load_background(args.video, T, H, W)
     H, W = bg.shape[1:3]
     uv = reproject(coords_sm, vis_keep, K)
     viz_colors = rainbow_colors_by_position(uv, vis_keep)
     vid = render_2d_overlay(bg, uv, vis_keep, viz_colors, trace=8)
-    out_mp4 = os.path.join(args.output_path, "tracks_2d.mp4")
+    out_mp4 = os.path.join(args.output_path, f"{args.output_name}_2d.mp4")
     media.write_video(out_mp4, vid, fps=args.fps)
     print(f"Saved {out_mp4}")
 
