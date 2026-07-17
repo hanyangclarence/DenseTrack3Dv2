@@ -4,7 +4,8 @@
 Two hand streams are recorded alongside the ZED RGB-D:
     /manus_glove_{side}                  manus_ros2_msgs/msg/ManusGlove   (~120 Hz)
         the raw Manus glove readout: 20 named ergonomics joint angles + a 25-node
-        hand skeleton (each node a 6-DOF pose).
+        hand skeleton (each node a 6-DOF pose) + the wrist sensor orientation
+        (raw_sensor_orientation) used to cancel wrist drift downstream.
     /dg5f_{side}/lj_dg_pospid/reference  control_msgs/msg/MultiDOFCommand (~120 Hz)
         the RETARGETED hand joints (20 DOF reference values) driving the robot hand;
         this is the action signal for the forward-dynamics (Model B) object-flow model.
@@ -46,7 +47,8 @@ def glove_topic(side):
 
 
 def retarget_topic(side):
-    return f"/dg5f_{side}/lj_dg_pospid/reference"
+    # joint-prefix is side-specific: left -> "lj", right -> "rj"
+    return f"/dg5f_{side}/{side[0]}j_dg_pospid/reference"
 
 
 def resolve_side(reader, side):
@@ -94,10 +96,12 @@ def read_frame_timestamps(reader, rgb_topic):
 
 def read_glove(reader, topic):
     """Read the ManusGlove stream. Returns timestamps (M,) int64 and per-message
-    ergonomics (M,20), raw_node_pose (M,25,7), plus the stable names/topology from
-    the first message."""
+    ergonomics (M,20), raw_node_pose (M,25,7), wrist_quat (M,4) [x,y,z,w] from
+    raw_sensor_orientation, plus the stable names/topology from the first message."""
     conns = [c for c in reader.connections if c.topic == topic]
-    ts, ergo, nodes = [], [], []
+    if not conns:
+        raise ValueError(f"glove topic {topic} not found in mcap.")
+    ts, ergo, nodes, wquat = [], [], [], []
     ergo_names = node_names = node_parent = None
     for conn, t, raw in reader.messages(connections=conns):
         m = reader.deserialize(raw, conn.msgtype)
@@ -110,14 +114,19 @@ def read_glove(reader, topic):
         nodes.append([[n.pose.position.x, n.pose.position.y, n.pose.position.z,
                        n.pose.orientation.x, n.pose.orientation.y,
                        n.pose.orientation.z, n.pose.orientation.w] for n in m.raw_nodes])
+        q = m.raw_sensor_orientation
+        wquat.append([q.x, q.y, q.z, q.w])
     return (np.array(ts, dtype=np.int64), np.array(ergo, dtype=np.float32),
-            np.array(nodes, dtype=np.float32), ergo_names, node_names, node_parent)
+            np.array(nodes, dtype=np.float32), np.array(wquat, dtype=np.float32),
+            ergo_names, node_names, node_parent)
 
 
 def read_retarget(reader, topic):
     """Read the MultiDOFCommand stream. Returns timestamps (M,) int64, values (M,20),
     and the stable dof_names from the first message."""
     conns = [c for c in reader.connections if c.topic == topic]
+    if not conns:
+        raise ValueError(f"retarget topic {topic} not found in mcap.")
     ts, vals = [], []
     dof_names = None
     for conn, t, raw in reader.messages(connections=conns):
@@ -151,9 +160,10 @@ def main():
         F = len(frame_ts)
         print(f"Camera timeline: {F} frames")
 
-        g_ts, ergo, nodes, ergo_names, node_names, node_parent = read_glove(reader, g_topic)
+        g_ts, ergo, nodes, wquat, ergo_names, node_names, node_parent = read_glove(reader, g_topic)
         r_ts, rvals, dof_names = read_retarget(reader, r_topic)
-        print(f"Glove: {len(g_ts)} msgs, ergonomics {ergo.shape}, nodes {nodes.shape}")
+        print(f"Glove: {len(g_ts)} msgs, ergonomics {ergo.shape}, nodes {nodes.shape}, "
+              f"wrist_quat {wquat.shape}")
         print(f"Retarget: {len(r_ts)} msgs, values {rvals.shape}")
 
     # nearest-timestamp resample both streams onto the camera timeline
@@ -172,6 +182,7 @@ def main():
         "raw_node_names": node_names,
         "raw_node_parent": node_parent,               # (25,)
         "raw_node_pose": nodes[gi],                    # (F, 25, 7)
+        "wrist_quat": wquat[gi],                       # (F, 4) [x,y,z,w] raw_sensor_orientation
         "max_align_offset_ms": float(max_off_ms),
     }
     out_path = os.path.join(args.output_dir, "hand.pkl")
@@ -180,6 +191,7 @@ def main():
           f"retarget_values {data['retarget_values'].shape}, "
           f"ergonomics {data['ergonomics'].shape}, "
           f"raw_node_pose {data['raw_node_pose'].shape}, "
+          f"wrist_quat {data['wrist_quat'].shape}, "
           f"max align offset {max_off_ms:.2f} ms")
 
 

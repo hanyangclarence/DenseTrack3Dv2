@@ -16,7 +16,11 @@
 # Stage 3 (track4world): Grounded-DINO + SAM2 segmentation of the prompted object.
 #   Only every STRIDE-th frame is segmented -- the windowed tracker seeds masks
 #   only at its window starts (multiples of STRIDE), so intermediate masks would
-#   be discarded. This cuts the pipeline's slowest stage ~STRIDE-fold.
+#   be discarded. This cuts the pipeline's slowest stage ~STRIDE-fold. Only the
+#   single highest-confidence detection is kept per frame (--max-detections 1),
+#   since each clip tracks exactly one goal object. "hand. glove." are given as
+#   negative prompts (--exclude-prompt) so the manipulator matches its own label
+#   and is dropped -- otherwise an occluded object can seed tracks on the hand.
 # Stage 4 (densetrack3d): windowed 3D tracking, reading depth straight from depth.mkv.
 # Stage 5 (densetrack3d): trajectory smoothing (attenuate hand-jitter) -> object_flow.pkl.
 # Intermediates (seg/ masks, track/ unsmoothed flow) are deleted after smoothing.
@@ -94,7 +98,9 @@ if [[ $FORCE -eq 1 || ! -d "$OUTDIR/seg/mask" ]]; then
       --text-prompt "$PROMPT" \
       --sam2-checkpoint "$SAM2_CKPT" \
       --output-dir "$OUTDIR/seg" \
-      --frame-stride "$STRIDE" )
+      --frame-stride "$STRIDE" \
+      --max-detections 1 \
+      --exclude-prompt "hand. glove." )
 else
   echo "skip: $OUTDIR/seg/mask already exists (use --force to redo)"
 fi
@@ -138,9 +144,11 @@ else
   echo "skip: object_flow.pkl already exists (use --force to redo)"
 fi
 
-# --- cleanup: seg masks + unsmoothed flow are intermediates -----------------
-banner "cleanup: removing intermediates (seg/, track/)"
-rm -rf "$OUTDIR/seg" "$OUTDIR/track"
+# --- cleanup: unsmoothed flow is an intermediate ----------------------------
+# Keep seg/ (object masks): the world-model label loader reads them to build the
+# object point cloud, so re-segmenting at load time is avoided.
+banner "cleanup: removing intermediates (track/)"
+rm -rf "$OUTDIR/track"
 
 banner "DONE"
 echo "Artifacts in $OUTDIR:"
