@@ -98,7 +98,7 @@ if [[ $FORCE -eq 1 || ! -d "$OUTDIR/seg/mask" ]]; then
       --text-prompt "$PROMPT" \
       --sam2-checkpoint "$SAM2_CKPT" \
       --output-dir "$OUTDIR/seg" \
-      --frame-stride "$STRIDE" \
+      --frame-stride 1 \
       --max-detections 1 \
       --exclude-prompt "hand. glove." )
 else
