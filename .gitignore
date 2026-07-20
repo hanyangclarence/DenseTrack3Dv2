@@ -31,3 +31,5 @@ demo_data/zed_capture/
 build/
 *.so
 *.o
+# generated normalization stats (reproducible via scripts/compute_flow_stats.py)
+data/flow_stats*.npz

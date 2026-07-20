@@ -65,6 +65,31 @@ def matrix_to_rotation_6d(R):
     return R[..., :, :2].reshape(*R.shape[:-2], 6)
 
 
+def train_eval_split(episodes, val_frac=0.15, seed=0):
+    """Split episodes into (train_eps, eval_eps) BY EPISODE, not by window.
+
+    Windows within one episode overlap heavily (stride_win=1), so splitting at the
+    window level would leak near-identical samples across the boundary. Splitting
+    whole episodes keeps eval genuinely held-out. `episodes` accepts the same forms
+    as the Dataset (episode dirs / a clip / the root); only dirs with a clouds.npz
+    are kept. Deterministic in (resolved episode list, val_frac, seed), so two callers
+    with the same args get complementary partitions. With a single episode, eval is
+    empty (nothing to hold out).
+
+    This is the ONE partition rule; the Dataset's `split=` config calls it, so a
+    `split="train"` Dataset and a `split="eval"` Dataset built with the same root /
+    val_frac / split_seed are exactly complementary."""
+    eps = FlowWindowDataset._resolve_episodes(episodes)
+    if len(eps) <= 1:
+        return eps, []
+    perm = np.random.default_rng(seed).permutation(len(eps))
+    n_val = max(1, int(round(len(eps) * val_frac)))
+    val = {int(k) for k in perm[:n_val]}
+    train_eps = [eps[i] for i in range(len(eps)) if i not in val]
+    eval_eps = [eps[i] for i in range(len(eps)) if i in val]
+    return train_eps, eval_eps
+
+
 class FlowWindowDataset(Dataset):
     """Sliding-window samples over precomputed episodes (spec §5.2).
 
@@ -74,12 +99,16 @@ class FlowWindowDataset(Dataset):
     index is built once at construction.
     """
 
-    def __init__(self, episodes, *, stride_hz=4, t_pred=8, t_hist=4, pred_pad=0,
+    def __init__(self, episodes, *, split="all", val_frac=0.15, split_seed=0,
+                 stride_hz=4, t_pred=8, t_hist=4, pred_pad=0,
                  n_query=16, min_visible=None, stride_win=1, articulation="ergonomics",
-                 use_wrist=True, wrist_repr="6d", seed=0):
+                 use_wrist=True, wrist_repr="6d", normalize=True, stats=None, seed=0):
         """
         episodes     : list of episode dirs, OR a clip dir, OR the dataset root
                        (auto-expanded to all episode_* that have a clouds.npz).
+        split        : which episode partition to use -- "train", "eval", or "all"
+        val_frac     : eval fraction of episodes when split != "all" (default 0.15).
+        split_seed   : RNG seed for the episode partition (must match across train/eval).
         stride_hz    : native-frame decimation (4 -> ~8 Hz, 2 -> ~15 Hz).
         t_pred       : reported prediction horizon in decimated steps (~1 s).
         t_hist       : history horizon in decimated steps (~0.5 s), < t_pred.
@@ -93,10 +122,16 @@ class FlowWindowDataset(Dataset):
         articulation : "ergonomics" (20) or "raw_node_pose" (24 keypoints x 3 = 72).
         use_wrist    : append the anchor-relative wrist rotation M_rel to each frame.
         wrist_repr   : "6d" (default) or "matrix" (9) -- ignored when use_wrist=False.
+        normalize    : per-channel standardize the hand features and attach per-channel
+                       target-displacement stats to each item (dxyz_mean/std) so the LOSS
+                       can standardize Delta xyz.
+        stats        : path to the .npz written by scripts/compute_flow_stats.py
         seed         : base RNG seed (per-item seeds are derived so sampling is stable).
         """
         assert articulation in ("ergonomics", "raw_node_pose")
         assert wrist_repr in ("6d", "matrix")
+        assert split in ("all", "train", "eval")
+        self.split = split
         self.stride_hz = int(stride_hz)
         self.t_pred = int(t_pred)
         self.t_hist = int(t_hist)
@@ -108,14 +143,22 @@ class FlowWindowDataset(Dataset):
         self.articulation = articulation
         self.use_wrist = bool(use_wrist)
         self.wrist_repr = wrist_repr
+        self.normalize = bool(normalize)
         self.seed = int(seed)
+        self._stats = dict(np.load(stats)) if stats is not None else None
+        if self.normalize and self._stats is None:
+            raise ValueError("normalize=True requires stats=<path to compute_flow_stats.py .npz>; "
+                             "pass normalize=False to emit raw features.")
 
-        self.episodes = self._resolve_episodes(episodes)
-        self._ep_cache = {}   # episode dir -> loaded arrays (lazy, process-local)
-        # Flat index of (episode_idx, present_frame_t) built once up front. A frame is
-        # kept iff its cloud is valid, the window is in bounds, and >= min_visible tracks
-        # are visible at t. We stash the accepted frames' visible counts (+ the dropped
-        # count) so coverage_summary() can sanity-check how tight the query demand is.
+        if split == "all":
+            self.episodes = self._resolve_episodes(episodes)
+        else:
+            train_eps, eval_eps = train_eval_split(episodes, val_frac=val_frac, seed=split_seed)
+            self.episodes = train_eps if split == "train" else eval_eps
+            if not self.episodes:
+                raise RuntimeError(f"split='{split}' is empty (need >=2 episodes for a split; "
+                                   f"got {len(self._resolve_episodes(episodes))}).")
+        self._ep_cache = {}   # episode dir -> loaded arrays
         self.index, self._dropped, counts = [], 0, []
         for ei, ep in enumerate(self.episodes):
             for t, nvis in self._candidate_present_frames(ep):
@@ -220,18 +263,23 @@ class FlowWindowDataset(Dataset):
 
         articulation (ergonomics or flattened raw_node_pose keypoints, node0 dropped)
         optionally concatenated with the anchor-relative wrist rotation M_rel(tau),
-        anchor = present frame t (so history and future are both relative to now)."""
+        anchor = present frame t (so history and future are both relative to now).
+        """
         if self.articulation == "ergonomics":
-            art = arrs["ergo"][frames]                                   # (F, 20)
+            art = arrs["ergo"][frames].astype(np.float32)                # (F, 20) deg
+            key = "ergo"
         else:
-            art = arrs["node"][frames, 1:, :3].reshape(len(frames), -1)  # (F, 24*3)
+            art = arrs["node"][frames, 1:, :3].reshape(len(frames), -1).astype(np.float32)  # (F, 72) m
+            key = "node"
+        if self.normalize:                                              # articulation only
+            art = (art - self._stats[f"{key}_mean"]) / self._stats[f"{key}_std"]
         if not self.use_wrist:
-            return art.astype(np.float32)
+            return art
         # M_rel over just this window's frames + the anchor, anchor-relative to t.
         idx = np.concatenate([[t], frames])                             # anchor first
         M = wrist_M_rel(arrs["wrist_quat"][idx], anchor=0)[1:]          # (F, 3, 3)
         wr = matrix_to_rotation_6d(M) if self.wrist_repr == "6d" \
-            else M.reshape(len(frames), 9)
+            else M.reshape(len(frames), 9)                             # left raw (bounded)
         return np.concatenate([art, wr.astype(np.float32)], axis=1)     # (F, d_q)
 
     def __getitem__(self, i):
@@ -258,7 +306,7 @@ class FlowWindowDataset(Dataset):
         q_hist = self._hand_features(arrs, t, hist_f)                  # (T_hist, d_q)
         q_future = self._hand_features(arrs, t, pred_f)                # (L_pred, d_q)
 
-        return dict(
+        item = dict(
             cloud=cloud.astype(np.float32),
             x0=x0.astype(np.float32),
             target=target.astype(np.float32),
@@ -269,6 +317,10 @@ class FlowWindowDataset(Dataset):
             frame_meta=dict(episode=ep, t=int(t), stride_hz=self.stride_hz,
                             t_pred=self.t_pred, l_pred=self.l_pred, query_idx=qidx),
         )
+        if self.normalize:
+            item["dxyz_mean"] = self._stats["dxyz_mean"].astype(np.float32)
+            item["dxyz_std"] = self._stats["dxyz_std"].astype(np.float32)
+        return item
 
 
 # --------------------------------------------------------------------------- #
