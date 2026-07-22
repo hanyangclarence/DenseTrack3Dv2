@@ -122,9 +122,7 @@ class FlowWindowDataset(Dataset):
                        or "camera_node_pose" (24 keypoints x 3 = 72 in the CAMERA frame)
         use_wrist    : append the anchor-relative wrist rotation M_rel to each frame.
         wrist_repr   : "6d" (default) or "matrix" (9) -- ignored when use_wrist=False.
-        normalize    : per-channel standardize the hand features and attach per-channel
-                       target-displacement stats to each item (dxyz_mean/std) so the LOSS
-                       can standardize Delta xyz.
+        normalize    : normalize=False should only be in scripts/compute_flow_stats.py
         stats        : path to the .npz written by scripts/compute_flow_stats.py
         seed         : base RNG seed (per-item seeds are derived so sampling is stable).
         """

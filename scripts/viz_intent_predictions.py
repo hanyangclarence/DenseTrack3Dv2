@@ -104,10 +104,10 @@ def build_dataset(ck: dict, args: argparse.Namespace) -> FlowWindowDataset:
 
 def _window_kwargs(h) -> dict:
     """The FlowWindowDataset kwargs implied by a DataModule's resolved hparams."""
-    return dict(stats=h.stats if h.normalize else None, stride_hz=h.stride_hz,
+    return dict(stats=h.stats, stride_hz=h.stride_hz,
                 t_pred=h.t_pred, t_hist=h.t_hist, pred_pad=h.pred_pad, n_query=h.n_query,
                 articulation=h.articulation, use_wrist=h.use_wrist,
-                wrist_repr=h.wrist_repr, normalize=h.normalize)
+                wrist_repr=h.wrist_repr)
 
 
 def select_indices(ds: FlowWindowDataset, args: argparse.Namespace) -> list[int]:

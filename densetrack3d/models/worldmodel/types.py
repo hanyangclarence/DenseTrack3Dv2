@@ -22,8 +22,7 @@ import torch
 
 
 class FlowItem(TypedDict, total=False):
-    """One sampling window (numpy). ``dxyz_mean``/``dxyz_std`` are present only when
-    the Dataset ran with ``normalize=True`` (hence ``total=False``)."""
+    """One sampling window (numpy)."""
     cloud: np.ndarray        # (P+N, 3)      float32  present-frame cloud + query seeds (network input)
     x0: np.ndarray           # (N, 3)        float32  query seeds x_{n,t}, always METRIC
     target: np.ndarray       # (L_pred, N, 3) float32 camera-frame positions, always METRIC
@@ -32,13 +31,12 @@ class FlowItem(TypedDict, total=False):
     q_future: np.ndarray     # (L_pred, d_q) float32  hand pose action (future)
     K: np.ndarray            # (4,)          float32  fx, fy, cx, cy (episode intrinsics)
     frame_meta: dict[str, Any]                       # episode dir, present frame t, stride_hz, ...
-    dxyz_mean: np.ndarray    # (3,)          float32  per-step displacement mean (normalize=True only)
-    dxyz_std: np.ndarray     # (3,)          float32  per-step displacement std  (normalize=True only)
+    dxyz_mean: np.ndarray    # (3,)          float32  per-step displacement mean
+    dxyz_std: np.ndarray     # (3,)          float32  per-step displacement std
 
 
 class IntentBatch(TypedDict, total=False):
-    """A collated mini-batch (torch). Float fields are stacked from ``FlowItem``; ``dxyz_*``
-    are always present after ``collate`` (identity stats injected when the Dataset omits them)."""
+    """A collated mini-batch (torch). Float fields are stacked from ``FlowItem``"""
     cloud: torch.Tensor        # (B, P+N, 3)      float32
     x0: torch.Tensor           # (B, N, 3)        float32  METRIC
     target: torch.Tensor       # (B, L_pred, N, 3) float32 METRIC

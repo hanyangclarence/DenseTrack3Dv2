@@ -39,9 +39,7 @@ from densetrack3d.models.worldmodel.types import FlowItem, IntentBatch, IntentOu
 # --------------------------------------------------------------------------- #
 # Batch assembly
 # --------------------------------------------------------------------------- #
-# The Dataset emits numpy dicts. Stack the array fields into a torch batch; keep
-# frame_meta as a plain list (Lightning moves only tensors to device, so the numpy/
-# str metadata rides along untouched). dxyz_mean/std exist only when normalize=True.
+# The Dataset emits numpy dicts. Stack the array fields into a torch batch
 _FLOAT_KEYS = ("cloud", "x0", "target", "q_hist", "q_future", "K", "dxyz_mean", "dxyz_std")
 
 
@@ -79,12 +77,6 @@ def collate(items: list[FlowItem]) -> IntentBatch:
             batch[k] = torch.from_numpy(np.stack([it[k] for it in items])).float()
     batch["target_vis"] = torch.from_numpy(np.stack([it["target_vis"] for it in items]))   # bool
     batch["frame_meta"] = [it["frame_meta"] for it in items]
-    # normalize=False Datasets omit dxyz stats; the loss/predict read them unconditionally.
-    # Identity stats (mean 0, std 1) make "no normalization" mean regressing raw-metre Delta.
-    if "dxyz_mean" not in batch:
-        b = batch["cloud"].shape[0]
-        batch["dxyz_mean"] = torch.zeros(b, 3)
-        batch["dxyz_std"] = torch.ones(b, 3)
     return batch
 
 
@@ -275,7 +267,7 @@ class FlowWindowDataModule(pl.LightningDataModule):
                  n_query: int = 16, val_frac: float = 0.15, split_seed: int = 0,
                  batch_size: int = 16, num_workers: int = 4, overfit_one_clip: bool = False,
                  articulation: str = "ergonomics", use_wrist: bool = True,
-                 wrist_repr: str = "6d", normalize: bool = True):
+                 wrist_repr: str = "6d"):
         super().__init__()
         self.save_hyperparameters()
         self.train_ds = None
@@ -286,15 +278,13 @@ class FlowWindowDataModule(pl.LightningDataModule):
             return
         h = self.hparams
         # dxyz stats are rate-specific; a stride_hz mismatch silently mis-scales the target.
-        # (Only meaningful when normalize=True; skip the check when we emit raw features.)
-        if h.normalize:
-            assert int(np.load(h.stats)["stride_hz"]) == h.stride_hz, \
-                f"stats stride_hz != {h.stride_hz}; recompute flow_stats with --stride-hz {h.stride_hz}"
+        assert int(np.load(h.stats)["stride_hz"]) == h.stride_hz, \
+            f"stats stride_hz != {h.stride_hz}; recompute flow_stats with --stride-hz {h.stride_hz}"
         source = h.clip or h.data_root
-        common = dict(stats=h.stats if h.normalize else None, stride_hz=h.stride_hz,
+        common = dict(stats=h.stats, stride_hz=h.stride_hz,
                       t_pred=h.t_pred, t_hist=h.t_hist, pred_pad=h.pred_pad, n_query=h.n_query,
                       articulation=h.articulation, use_wrist=h.use_wrist,
-                      wrist_repr=h.wrist_repr, normalize=h.normalize)
+                      wrist_repr=h.wrist_repr)
         if h.overfit_one_clip:                              # gate 3: memorize one clip, no held-out
             assert h.clip is not None, \
                 "overfit_one_clip=True needs --data.clip <dir>; else it overfits the WHOLE dataset"
