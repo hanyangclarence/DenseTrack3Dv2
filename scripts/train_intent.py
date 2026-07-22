@@ -47,10 +47,12 @@ _FLOAT_KEYS = ("cloud", "x0", "target", "q_hist", "q_future", "K", "dxyz_mean", 
 def _compute_d_q(articulation, use_wrist, wrist_repr):
     """Hand-feature width the encoder must accept -- mirrors Dataset._hand_features.
 
-    articulation dim (ergonomics 20 / raw_node_pose 24 keypoints x3 = 72) + wrist rotation
-    (none, 6D=6, or matrix=9). Linked into model.model_cfg.d_q so the two can't disagree.
+    articulation dim (ergonomics 20 / raw_node_pose or camera_node_pose 24 keypoints x3 = 72)
+    + wrist rotation (none, 6D=6, or matrix=9). Linked into model.model_cfg.d_q so the two can't disagree.
     """
     art = 20 if articulation == "ergonomics" else 72
+    if articulation == "camera_node_pose":
+        return art                                                   # wrist implicit in positions
     wr = 0 if not use_wrist else (6 if wrist_repr == "6d" else 9)
     return art + wr
 

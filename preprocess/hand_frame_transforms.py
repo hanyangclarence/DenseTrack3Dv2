@@ -68,8 +68,9 @@ T_PP_P = np.array([[1, 0, 0, 0],
                    [0, 1, 0, 0],
                    [0, 0, 0, 1]], dtype=np.float64)
 
-# Composed camera-optical -> P (4x4 homogeneous).
+# Composed camera-optical -> P (4x4 homogeneous), and its inverse P -> camera-optical.
 T_CAM_P = T_PP_P @ T_LENS_PP @ T_CAM_LENS
+T_P_CAM = np.linalg.inv(T_CAM_P)
 # =============================================================================
 
 
@@ -133,6 +134,21 @@ def placed_hand_P(node_pos, M_rel):
     node_pos: (T, 25, 3) raw hand-local skeleton. M_rel: (T, 3, 3). Returns (T, 25, 3) in P.
     Add T_HAND_TO_P (and any fine-tune) afterwards at the call site."""
     return np.einsum("ij,tjk,tnk->tni", G, M_rel, node_pos)
+
+
+def placed_hand_camera(node_pos, M_rel):
+    """Full moving hand in CAMERA-OPTICAL frame: (P placement) then P -> camera.
+
+    Places the raw hand-local skeleton into P exactly as placed_hand_P, then maps back to the camera-optical
+    frame so the keypoints share ONE frame with the object cloud / query points
+
+    node_pos: (T, 25, 3) raw hand-local skeleton. M_rel: (T, 3, 3) anchored wrist rotation.
+    Returns (T, 25, 3) in camera-optical metres (same frame as object_flow.pkl coords)."""
+    hand_P = placed_hand_P(node_pos, M_rel) + T_HAND_TO_P    # (T,25,3) in P
+    shp = hand_P.shape
+    flat = hand_P.reshape(-1, 3)
+    homo = np.concatenate([flat, np.ones((flat.shape[0], 1))], axis=1)
+    return (T_P_CAM @ homo.T).T[:, :3].reshape(shp)          # (T,25,3) camera
 
 
 def wrist_frame_flow(coords_cam, wrist_quat, anchor=0):

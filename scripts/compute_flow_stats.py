@@ -17,9 +17,8 @@ different and must be treated differently:
                                  articulation input when articulation="ergonomics".
   - node_mean  / node_std  (72,) flattened raw_node_pose keypoints 1..24 (m) -> whiten
                                  the articulation input when articulation="raw_node_pose".
-  - cloud_mean / cloud_std (3,)  object-cloud xyz over all present-frame clouds -> the
-                                 center + scale for later cloud/query centering (NOT
-                                 applied yet; recorded so it's ready).
+  - cloud_mean (3,) + cloud_scale (scalar)  object-cloud xyz normalization: the network
+                                 input is standardized as (cloud - cloud_mean) / cloud_scale.
 The wrist-rotation block (M_rel as 6D / matrix) is deliberately NOT normalized -- it
 is already a bounded rotation representation with unit-norm structure -- so no stats
 are produced for it.
@@ -134,17 +133,19 @@ def main():
     cloud_m, cloud_s = cloud.mean_std(args.floor)
     ergo_m, ergo_s = ergo.mean_std(args.floor)
     node_m, node_s = node.mean_std(args.floor)
+    cloud_scale = np.float32(np.sqrt((cloud_s.astype(np.float64) ** 2).mean()))
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez(args.out,
              dxyz_mean=dxyz_m, dxyz_std=dxyz_s,
              ergo_mean=ergo_m, ergo_std=ergo_s,
              node_mean=node_m, node_std=node_s,
-             cloud_mean=cloud_m, cloud_std=cloud_s,
+             cloud_mean=cloud_m, cloud_std=cloud_s, cloud_scale=cloud_scale,
              stride_hz=np.int32(args.stride_hz))
     print(f"\nwrote {args.out}")
     print(f"  dxyz  mean {dxyz_m.round(5)}  std {dxyz_s.round(5)}  (m/step, visible)")
-    print(f"  cloud mean {cloud_m.round(4)}  std {cloud_s.round(4)}  (m)")
+    print(f"  cloud mean {cloud_m.round(4)}  std {cloud_s.round(4)}  (m, per-ch provenance)")
+    print(f"  cloud_scale {float(cloud_scale):.4f} m  (isotropic; the divisor used to normalize)")
     print(f"  ergo  std range [{ergo_s.min():.2f}, {ergo_s.max():.2f}] deg  (20 ch)")
     print(f"  node  std range [{node_s.min():.4f}, {node_s.max():.4f}] m    (72 ch)")
 

@@ -1,10 +1,26 @@
 # Object-Flow Intent Model — Design Spec
 
 **Date:** 2026-07-17
-**Status:** design, pending review
+**Status:** design; the architecture (§6/§7) is refined and in places **superseded** by
+`2026-07-20-object-flow-model-architecture-detail.md` — see the changelog below.
 **Context:** clean rewrite of the earlier `object_flow_models_plan.md` / `2026-07-13` design after
 the wrist-pose work, the single-cloud + hand-history reformulation, and the decision to keep the v1
-target simple (per-step delta + visibility). **This is the current spec.**
+target simple (per-step delta + visibility). This is the current spec for §1–§5 and §8–§12; for the
+model internals (§6/§7) the 07-20 detail doc is authoritative where they differ.
+
+> **Changelog — superseded by `2026-07-20` (read that doc for the model internals):**
+> - **§6.2 query-token `ctx` seeding → removed.** The pooled hand-history `ctx` added to every object
+>   token is dropped. History reaches the model through the **history-aware `a_future`** (the hand
+>   encoder is sequential over `[hist ; future]`, so each future step already integrates the history);
+>   a separate `ctx` add is redundant. (07-20 §5, §6.)
+> - **§6.3 hand-token injection & "25 tokens" (K=1/25) → removed.** A hand pose is **one `C`-vector per
+>   step**, not a token axis; action injection is **FiLM only** (per-step affine), no concat on the token
+>   axis. The parent's forward sketch applied *both* additive-inject and token-concat at once (they were
+>   framed as alternatives) — 07-20's FiLM-only is the resolution. So the "FiLM vs hand-token" / "K=1 vs
+>   25" ablations in §9 step 4 and §12 are **withdrawn**. (07-20 §5, §7.)
+> - **Cloud normalization** is **global center + single isotropic scale** (shape-preserving), not
+>   per-channel standardization; target deltas remain per-channel standardized. (07-20 §2.1.)
+> - **Intrinsics** are stored as `K (4,) = fx,fy,cx,cy` (see the §5.2 item dict below), not `(3,3)`.
 
 One model: an **action-conditioned forward-dynamics / intent model** that predicts future 3D object
 flow from (a) a **single** point-cloud observation of the object, (b) the recent **hand-pose
@@ -241,7 +257,7 @@ Item dict returned by the Dataset:
   x0 (N,3),                                  # query seeds x_{n,t} (also the last N rows of cloud)
   target (L_pred, N, 3) xyz,  target_vis (L_pred, N),
   q_hist (T_hist, ·),  q_future (L_pred, ·), # articulation ⊕ M_rel
-  K (3,3),  frame_meta }
+  K (4,) fx,fy,cx,cy,  frame_meta }
 ```
 (Cache uses `x0` for the notation's `x_{n,t}`.) Every frame is a candidate present-frame; windows
 stride the episode every `stride_win` frames (default 1 — every frame a sample).

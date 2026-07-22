@@ -54,7 +54,7 @@ from torch.utils.data import Dataset
 
 # repo root is the parent of data/ -- allow running as a script (python data/...py)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from preprocess.hand_frame_transforms import wrist_M_rel
+from preprocess.hand_frame_transforms import wrist_M_rel, placed_hand_camera
 
 
 def matrix_to_rotation_6d(R):
@@ -115,12 +115,10 @@ class FlowWindowDataset(Dataset):
         t_hist       : history horizon in decimated steps (~0.5 s), < t_pred.
         pred_pad     : extra predicted steps beyond t_pred (L_pred = t_pred + pred_pad).
         n_query      : query points sampled per window (N).
-        min_visible  : a present-frame is kept only if at least this many tracks are
-                       visible at t; below it there are too few real points to sample
-                       (the genuine failure -- not merely visible < n_query, which we
-                       handle by sampling with replacement). Default n_query // 2.
+        min_visible  : a present-frame is kept only if at least this many tracks are visible at t
         stride_win   : present-frame stride over the episode (1 = every frame).
-        articulation : "ergonomics" (20) or "raw_node_pose" (24 keypoints x 3 = 72).
+        articulation : "ergonomics" (20), "raw_node_pose" (24 hand-LOCAL keypoints x 3 = 72),
+                       or "camera_node_pose" (24 keypoints x 3 = 72 in the CAMERA frame)
         use_wrist    : append the anchor-relative wrist rotation M_rel to each frame.
         wrist_repr   : "6d" (default) or "matrix" (9) -- ignored when use_wrist=False.
         normalize    : per-channel standardize the hand features and attach per-channel
@@ -129,8 +127,12 @@ class FlowWindowDataset(Dataset):
         stats        : path to the .npz written by scripts/compute_flow_stats.py
         seed         : base RNG seed (per-item seeds are derived so sampling is stable).
         """
-        assert articulation in ("ergonomics", "raw_node_pose")
+        assert articulation in ("ergonomics", "raw_node_pose", "camera_node_pose")
         assert wrist_repr in ("6d", "matrix")
+        # camera_node_pose bakes the wrist rotation into absolute keypoint positions, so an
+        # explicit M_rel block would be redundant
+        if articulation == "camera_node_pose":
+            use_wrist = False
         assert split in ("all", "train", "eval")
         self.split = split
         self.stride_hz = int(stride_hz)
@@ -262,10 +264,27 @@ class FlowWindowDataset(Dataset):
     def _hand_features(self, arrs, t, frames):
         """Assemble (len(frames), d_q) hand features for the given native frames.
 
-        articulation (ergonomics or flattened raw_node_pose keypoints, node0 dropped)
-        optionally concatenated with the anchor-relative wrist rotation M_rel(tau),
-        anchor = present frame t (so history and future are both relative to now).
+        articulation (ergonomics / raw_node_pose / camera_node_pose) optionally concatenated
+        with the anchor-relative wrist rotation M_rel(tau), anchor = present frame t (so history
+        and future are both relative to now).
+
+        - ergonomics       : (20) joint angles.
+        - raw_node_pose    : (72) hand-LOCAL keypoints
+        - camera_node_pose : (72) keypoints 1..24 placed in the CAMERA frame (M_rel anchored at
+                             t, then P->camera)
         """
+        if self.articulation == "camera_node_pose":
+            idx = np.concatenate([[t], frames])                         # anchor first
+            M = wrist_M_rel(arrs["wrist_quat"][idx], anchor=0)[1:]      # (F, 3, 3), rel to t
+            node = arrs["node"][frames, :, :3].astype(np.float64)      # (F, 25, 3) local, node0=origin
+            kp_cam = placed_hand_camera(node, M)[:, 1:]                # (F, 24, 3) camera; drop const wrist
+            art = kp_cam.reshape(len(frames), -1).astype(np.float32)   # (F, 72)
+            if self.normalize:                                         # SAME transform as the cloud
+                art = (art.reshape(len(frames), 24, 3) - self._stats["cloud_mean"]) \
+                    / self._stats["cloud_scale"]
+                art = art.reshape(len(frames), -1).astype(np.float32)
+            return art                                                 # no wrist block (implicit)
+
         if self.articulation == "ergonomics":
             art = arrs["ergo"][frames].astype(np.float32)                # (F, 20) deg
             key = "ergo"
