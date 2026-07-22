@@ -984,6 +984,7 @@ class CrossAttnBlock(nn.Module):
         )
 
     def forward(self, x, context, mask=None):
+        attn_bias = mask
         if mask is not None:
             if mask.shape[1] == x.shape[1]:
                 mask = mask[:, None, :, None].expand(-1, self.cross_attn.heads, -1, context.shape[1])

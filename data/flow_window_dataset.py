@@ -34,9 +34,10 @@ rotation M_rel(tau) = R(q_t)^T R(q_tau) (anchor = present frame t), as 6D or 3x3
 The default (ergonomics + M_rel-6D) gives d_q = 26.
 
 Item dict (numpy; a collate wrapper can torch-ify):
-    cloud       (P+N, 3)        float32  present-frame object cloud, query seeds appended
-    x0          (N, 3)          float32  query seeds x_{n,t} (== cloud[-N:])
-    target      (L_pred, N, 3)  float32  camera-frame positions x_{n, t+1 : t+L_pred+1}
+    cloud       (P+N, 3)        float32  present-frame object cloud, query seeds appended;
+                                         cloud-standardized when normalize=True (network input)
+    x0          (N, 3)          float32  query seeds x_{n,t}, always METRIC
+    target      (L_pred, N, 3)  float32  camera-frame positions x_{n, t+1 : t+L_pred+1}, always METRIC
     target_vis  (L_pred, N)     bool     per-step visibility of each query point
     q_hist      (T_hist, d_q)   float32  hand pose cue (history)
     q_future    (L_pred, d_q)   float32  hand pose action (future)
@@ -294,13 +295,15 @@ class FlowWindowDataset(Dataset):
         visible = np.nonzero(vis[t])[0]
         qidx = rng.choice(visible, self.n_query, replace=visible.size < self.n_query)
 
-        x0 = coords[t, qidx]                                            # (N, 3) query seeds
-        target = coords[pred_f][:, qidx]                               # (L_pred, N, 3)
+        x0 = coords[t, qidx]                                            # (N, 3) query seeds (METRIC)
+        target = coords[pred_f][:, qidx]                               # (L_pred, N, 3) METRIC
         target_vis = vis[pred_f][:, qidx]                              # (L_pred, N)
 
         # --- state cloud: precomputed cloud at t, with query seeds concatenated ----
-        cloud = arrs["clouds"][t]                                      # (P, 3)
-        cloud = np.concatenate([cloud, x0], axis=0)                    # (P+N, 3)
+        cloud = arrs["clouds"][t]                                      # (P, 3) metric
+        cloud = np.concatenate([cloud, x0], axis=0)                    # (P+N, 3) metric
+        if self.normalize:
+            cloud = (cloud - self._stats["cloud_mean"]) / self._stats["cloud_scale"]
 
         # --- hand: history (cue) + future (action) ---------------------------------
         q_hist = self._hand_features(arrs, t, hist_f)                  # (T_hist, d_q)

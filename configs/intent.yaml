@@ -1,0 +1,71 @@
+# Object-flow intent model training config (LightningCLI).
+#   /home/labeng/miniconda3/envs/densetrack3d/bin/python scripts/train_intent.py fit --config configs/intent.yaml
+#
+# n_query / t_pred / pred_pad are set under `data` ONLY -- they are linked into the
+# model config by IntentCLI (data is the source of truth for window shape), so do not
+# also set model.model_cfg.{n_query,t_pred,l_pred} here or the link will reject it.
+seed_everything: 0
+
+data:
+  data_root: /home/labeng/yanghan/data/inhand_manipulation
+  clip: null                 # set (with overfit_one_clip: true) to run gate 3 on one clip
+  stats: data/flow_stats.npz
+  stride_hz: 4               # must match the stats file's stride_hz
+  t_pred: 8
+  t_hist: 4
+  pred_pad: 0
+  n_query: 16
+  val_frac: 0.15
+  split_seed: 0
+  batch_size: 256
+  num_workers: 8             # B=256 loads 16x more windows/batch; 4 starves the GPU
+  overfit_one_clip: false
+
+model:
+  lr: 4.0e-4                   # sqrt-scaled for B=256 (sqrt(16)*1e-4); AdamW, with warmup+clip
+  lr_min: 4.0e-6               # keep the 0.01 min/peak ratio
+  warmup_steps: 500            # ~2.6% of ~19k total steps (B=256 -> ~480 steps/epoch)
+  weight_decay: 0.01
+  model_cfg:                 # IntentModelConfig; n_query/t_pred/l_pred come from data (linked)
+    C: 384
+    depth: 6
+    heads: 6
+    emb_C: 128
+    pos_scale: 0.02
+    w_vis: 1.0
+    reg: mse
+
+ema:
+  decay: 0.999
+
+optimizer: null              # IntentLitModule.configure_optimizers owns AdamW + schedule
+lr_scheduler: null
+
+trainer:
+  max_epochs: 40             # B=256 -> ~480 steps/epoch, ~19k total updates (~7 min/epoch)
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 1.0     # spec §6.5
+  log_every_n_steps: 20
+  val_check_interval: 500    # ~once/epoch at B=256 (~480 steps/epoch)
+  check_val_every_n_epoch: null
+  default_root_dir: logdirs/intent
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: object-flow-intent
+      save_dir: logdirs/intent
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: logdirs/intent/ckpts
+        filename: "epoch{epoch:03d}-ade{val/ade_m:.4f}"
+        monitor: val/ade_m
+        mode: min
+        save_top_k: 3
+        save_last: true
+        auto_insert_metric_name: false
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
