@@ -46,12 +46,14 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.flow_window_dataset import FlowWindowDataset
+from densetrack3d.models.worldmodel import IntentModel
+from densetrack3d.models.worldmodel.types import FlowItem
 from postprocess.smooth_object_motion import reproject
 from preprocess.track_windowed import render_2d_overlay, rainbow_colors_by_position
 from scripts.train_intent import FlowWindowDataModule, collate, load_ema_model
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", required=True, help="intent-model checkpoint (EMA weights loaded)")
@@ -76,12 +78,12 @@ def parse_args():
 # --------------------------------------------------------------------------- #
 # Dataset reconstruction (rebuild the EXACT split the checkpoint reported on)
 # --------------------------------------------------------------------------- #
-def _dh_from_ckpt(ck):
+def _dh_from_ckpt(ck: dict) -> dict:
     """The datamodule hyperparameters saved in the checkpoint (drop private keys)."""
     return {k: v for k, v in ck["datamodule_hyper_parameters"].items() if not k.startswith("_")}
 
 
-def build_dataset(ck, args):
+def build_dataset(ck: dict, args: argparse.Namespace) -> FlowWindowDataset:
     """A FlowWindowDataset matching the ckpt's data config.
 
     Default: the held-out eval split (what val/ade_m was measured on) via FlowWindowDataModule,
@@ -100,7 +102,7 @@ def build_dataset(ck, args):
     return FlowWindowDataset(args.episode, split="all", **_window_kwargs(dm.hparams))
 
 
-def _window_kwargs(h):
+def _window_kwargs(h) -> dict:
     """The FlowWindowDataset kwargs implied by a DataModule's resolved hparams."""
     return dict(stats=h.stats if h.normalize else None, stride_hz=h.stride_hz,
                 t_pred=h.t_pred, t_hist=h.t_hist, pred_pad=h.pred_pad, n_query=h.n_query,
@@ -108,7 +110,7 @@ def _window_kwargs(h):
                 wrist_repr=h.wrist_repr, normalize=h.normalize)
 
 
-def select_indices(ds, args):
+def select_indices(ds: FlowWindowDataset, args: argparse.Namespace) -> list[int]:
     """Dataset indices to render: random-N (seeded) or the one matching --episode/--frame."""
     if args.episode is not None and args.frame is not None:
         matches = [i for i, (_, t) in enumerate(ds.index) if t == args.frame]
@@ -126,7 +128,7 @@ def select_indices(ds, args):
 # Inference on one item
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
-def run_inference(model, item, device):
+def run_inference(model: IntentModel, item: FlowItem, device: str) -> dict:
     """One item -> numpy dict {x0, gt, gt_vis, pred, vis_prob, K, meta}. All metric except vis."""
     batch = collate([item])
     batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -144,7 +146,7 @@ def run_inference(model, item, device):
     )
 
 
-def sample_ade_mm(res):
+def sample_ade_mm(res: dict) -> float:
     """Per-sample mean displacement error (mm) over visible steps -- the cheap correctness oracle."""
     err = np.linalg.norm(res["pred"] - np.nan_to_num(res["gt"]), axis=-1)   # (H,N)
     m = res["gt_vis"].astype(np.float32)
@@ -154,14 +156,14 @@ def sample_ade_mm(res):
 # --------------------------------------------------------------------------- #
 # Timeline assembly + RGB frames
 # --------------------------------------------------------------------------- #
-def frame_grid(t, t_hist, s, H):
+def frame_grid(t: int, t_hist: int, s: int, H: int) -> list[int]:
     """Native frame indices for the render timeline: history -> present -> future (len S)."""
     hist = [t - (t_hist - k) * s for k in range(t_hist)]
     pred = [t + (j + 1) * s for j in range(H)]
     return hist + [t] + pred                                     # len = t_hist + 1 + H
 
 
-def load_window_frames(video_path, native_indices):
+def load_window_frames(video_path: str, native_indices: list[int]) -> np.ndarray:
     """(S,H,W,3) RGB uint8 read at the given native frame indices via seek (not a full decode)."""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -177,7 +179,8 @@ def load_window_frames(video_path, native_indices):
     return np.stack(frames)
 
 
-def build_timeline(res, t_hist, s, pred_vis_gate):
+def build_timeline(res: dict, t_hist: int, s: int, pred_vis_gate: bool) -> tuple[
+        np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Per-panel metric position stacks (S,N,3) + visibility (S,N) for GT and Pred.
 
     History+present steps freeze both panels at x0 (visible); future steps use gt/pred.
@@ -204,13 +207,14 @@ def build_timeline(res, t_hist, s, pred_vis_gate):
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
-def _label(img, text, org, color=(255, 255, 255)):
+def _label(img: np.ndarray, text: str, org: tuple[int, int],
+           color: tuple[int, int, int] = (255, 255, 255)) -> None:
     """Draw text with a dark outline so it reads on any background (in place; expects contiguous)."""
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
 
 
-def render_sample(res, bg, t_hist, args):
+def render_sample(res: dict, bg: np.ndarray, t_hist: int, args: argparse.Namespace) -> np.ndarray:
     """One sample -> (S, H+header, 2W, 3) RGB video: [GT | Pred], labeled, with a per-step header."""
     s = int(res["meta"]["stride_hz"])
     H_pred = res["pred"].shape[0]
@@ -249,7 +253,8 @@ def render_sample(res, bg, t_hist, args):
     return np.stack(frames)
 
 
-def viz_one_sample(model, ds, i, args):
+def viz_one_sample(model: IntentModel, ds: FlowWindowDataset, i: int,
+                   args: argparse.Namespace) -> str:
     item = ds[i]
     res = run_inference(model, item, args.device)
     m = res["meta"]
@@ -266,7 +271,7 @@ def viz_one_sample(model, ds, i, args):
     return out_path
 
 
-def main():
+def main() -> None:
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
     ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)

@@ -74,8 +74,10 @@ T_P_CAM = np.linalg.inv(T_CAM_P)
 # =============================================================================
 
 
-def quat_to_R(q):
-    """Quaternion (x, y, z, w) -> 3x3 rotation. Returns identity for a ~zero quat."""
+def quat_to_R(q: np.ndarray) -> np.ndarray:
+    """Quaternion (x, y, z, w) -> 3x3 rotation. Returns identity for a ~zero quat.
+
+    q: (4,) array-like. Returns (3, 3) float64."""
     x, y, z, w = q
     n = x * x + y * y + z * z + w * w
     if n < 1e-12:
@@ -87,7 +89,7 @@ def quat_to_R(q):
         [(x*z-w*y)*s,     (y*z+w*x)*s,     1 - (x*x+y*y)*s]], dtype=np.float64)
 
 
-def transform_cloud_to_P(coords_cam):
+def transform_cloud_to_P(coords_cam: np.ndarray) -> np.ndarray:
     """Object cloud camera-optical -> P: p_P = T_CAM_P @ [p_cam; 1].
 
     coords_cam: (..., 3) in camera-optical frame. Returns same shape, in P.
@@ -98,7 +100,7 @@ def transform_cloud_to_P(coords_cam):
     return (T_CAM_P @ homo.T).T[:, :3].reshape(shp)
 
 
-def wrist_M_rel(quat_al, anchor=0):
+def wrist_M_rel(quat_al: np.ndarray, anchor: int = 0) -> np.ndarray:
     """Anchor-relative wrist rotation M_rel(t) = R(q_a)^T R(q_t) for every frame.
 
     quat_al: (T, 4) per-frame wrist quaternions (x, y, z, w), already frame-aligned.
@@ -111,7 +113,7 @@ def wrist_M_rel(quat_al, anchor=0):
     return np.stack([Ra_inv @ quat_to_R(quat_al[t]) for t in range(T)])  # (T,3,3)
 
 
-def stabilized_cloud_P(coords_P, M_rel):
+def stabilized_cloud_P(coords_P: np.ndarray, M_rel: np.ndarray) -> np.ndarray:
     """Cancel wrist rotation on a P-frame cloud, keeping P orientation.
 
     cloud_stab(t) = S_P(t) @ p_P(t),  S_P(t) = G @ M_rel(t)^T @ G   (G @ G = I).
@@ -121,14 +123,14 @@ def stabilized_cloud_P(coords_P, M_rel):
     return np.einsum("tij,tnj->tni", S_P, coords_P)          # (T,N,3)
 
 
-def stabilized_hand_P(node_pos):
+def stabilized_hand_P(node_pos: np.ndarray) -> np.ndarray:
     """Wrist-frozen hand in P: G @ p_raw (drops M_rel; the wrist is fixed in its own frame).
 
     node_pos: (T, 25, 3) raw hand-local skeleton positions. Returns (T, 25, 3) in P."""
     return np.einsum("ij,tnj->tni", G, node_pos)
 
 
-def placed_hand_P(node_pos, M_rel):
+def placed_hand_P(node_pos: np.ndarray, M_rel: np.ndarray) -> np.ndarray:
     """Full moving hand in P: G @ M_rel(t) @ p_raw(t)  (order matters -- M_rel is hand-local).
 
     node_pos: (T, 25, 3) raw hand-local skeleton. M_rel: (T, 3, 3). Returns (T, 25, 3) in P.
@@ -136,7 +138,7 @@ def placed_hand_P(node_pos, M_rel):
     return np.einsum("ij,tjk,tnk->tni", G, M_rel, node_pos)
 
 
-def placed_hand_camera(node_pos, M_rel):
+def placed_hand_camera(node_pos: np.ndarray, M_rel: np.ndarray) -> np.ndarray:
     """Full moving hand in CAMERA-OPTICAL frame: (P placement) then P -> camera.
 
     Places the raw hand-local skeleton into P exactly as placed_hand_P, then maps back to the camera-optical
@@ -151,7 +153,7 @@ def placed_hand_camera(node_pos, M_rel):
     return (T_P_CAM @ homo.T).T[:, :3].reshape(shp)          # (T,25,3) camera
 
 
-def wrist_frame_flow(coords_cam, wrist_quat, anchor=0):
+def wrist_frame_flow(coords_cam: np.ndarray, wrist_quat: np.ndarray, anchor: int = 0) -> np.ndarray:
     """One-shot camera-frame object flow -> P-frame, wrist-rotation cancelled.
 
     coords_cam: (T, N, 3) object flow in camera-optical frame (object_flow.pkl coords).

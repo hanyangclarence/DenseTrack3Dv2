@@ -23,6 +23,7 @@ from densetrack3d.models.worldmodel.backbone import IntentBackbone, init_query_t
 from densetrack3d.models.worldmodel.hand_encoder import HandEncoder
 from densetrack3d.models.worldmodel.heads import Heads
 from densetrack3d.models.worldmodel.point_encoder import PointEncoder, PosEnc
+from densetrack3d.models.worldmodel.types import IntentBatch, IntentOutput
 
 
 def _default_sa_cfg():
@@ -74,7 +75,7 @@ class IntentModel(nn.Module):
         self.step_emb = nn.Parameter(torch.zeros(cfg.l_pred, cfg.C))           # learned per-step
         nn.init.trunc_normal_(self.step_emb, std=0.02)
 
-    def forward(self, batch):
+    def forward(self, batch: IntentBatch) -> IntentOutput:
         cloud = batch["cloud"]                                     # (B, P+N, 3) normalized
         # fail loudly on a dataset/config mismatch (else it surfaces as a cryptic FiLM broadcast error)
         assert cloud.shape[1] > self.N, (
@@ -92,7 +93,9 @@ class IntentModel(nn.Module):
         return dict(delta=delta, vis_logit=vis_logit)
 
     @torch.no_grad()
-    def predict_trajectory(self, batch, out=None):
+    def predict_trajectory(
+        self, batch: IntentBatch, out: Optional[IntentOutput] = None
+        ) -> tuple[torch.Tensor, torch.Tensor]:
         """De-standardize delta and compose the metric trajectory anchored on METRIC x0 (§8)."""
         if out is None:
             out = self.forward(batch)
@@ -108,7 +111,9 @@ class IntentModel(nn.Module):
         return x_pred, vis_prob
 
 
-def intent_loss(out, batch, w_vis=1.0, reg="mse"):
+def intent_loss(
+        out: IntentOutput, batch: IntentBatch, w_vis: float = 1.0, reg: str = "mse"
+        ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Per-channel standardized MSE on per-step displacement (visibility-masked) + balanced BCE."""
     # ground-truth per-step displacement in metres
     traj = torch.cat([batch["x0"][:, None], batch["target"]], dim=1)   # (B, L_pred+1, N, 3)

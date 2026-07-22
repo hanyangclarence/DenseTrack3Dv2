@@ -21,27 +21,43 @@ Auto-appended by `scripts/run_sweep.py`. 10 epochs each, val/ade_m is the metric
 | no_norm | normalize=False | **9.18** | 16.08 | 9 | 0.000 | 1.026 | 0.000 | ok |
 | nquery_32 | n_query=32 | **4.34** | 7.61 | 8 | 0.854 | 1.302 | 0.100 | ok |
 | small | C=256, heads=4, depth=4 | **4.37** | 7.57 | 8 | 0.852 | 0.916 | 0.148 | ok |
+| wvis_0 | w_vis=0.0 | **4.40** | 7.67 | 9 | 0.860 | 1.696 | 0.091 | ok |
+| cam_hand | articulation=camera_node_pose | **4.19** | 7.40 | 9 | 0.814 | 1.166 | 0.136 | ok |
+| ema_0.995 | decay=0.995 | **4.35** | 7.59 | 5 | 0.860 | 0.912 | 0.111 | ok |
+| ema_0.99 | decay=0.99 | **4.36** | 7.58 | 3 | 0.862 | 0.811 | 0.111 | ok |
+| best | articulation=camera_node_pose, w_vis=0.25 | **4.16** | 7.35 | 9 | 0.805 | 0.900 | 0.114 | ok |
 
 ## Analysis
 
 All 8-step ADE numbers are directly comparable **except** `pred_4`/`pred_16` (different
 horizons — compare their FDE at a fixed step instead) and `no_norm` (see below). Best-epoch
-was 7–9 for every run, so 10 epochs was sufficient to capture the minimum.
+was 7–9 for every run except the shorter-window EMA runs (`ema_0.995`/`ema_0.99` peaked at
+epochs 5/3), so 10 epochs captured the minimum for the fixed-EMA configs — but see the note
+that the camera-frame runs were still improving at epoch 9.
 
-### The one axis that moves ADE: the wrist frame
+### The one axis that moves ADE: how the wrist frame enters the hand features
 
 | config | ADE (mm) | vs baseline |
 |---|---|---|
 | `no_wrist` (drop wrist rotation) | 5.17 | **+19%** (much worse) |
 | `6d` wrist (baseline) | 4.34 | — |
-| `matrix` (9-D) wrist | **4.26** | **−2%** (best real config) |
+| `matrix` (9-D) wrist | 4.26 | −2% |
+| `cam_hand` (keypoints in camera frame) | 4.19 | −3.5% |
+| `best` (`cam_hand` + `w_vis=0.25`) | **4.16** | **−4%** (sweep best) |
 
 Wrist orientation is **load-bearing** for object-motion prediction — unsurprising for
 in-hand manipulation, where the object rides the wrist frame. Dropping it costs 19% and
-raises `val/reg` to 1.12. Representing the rotation as a full 3×3 matrix beats the 6-D
-Gram–Schmidt parameterization by a small but consistent margin (lowest `val/reg` 0.821 and
-lowest FDE 7.48 in the whole sweep). **This is the sweep's headline recommendation:
-`wrist_repr=matrix`.**
+raises `val/reg` to 1.12. But *how* the wrist enters the features matters more than its
+representation: an explicit rotation block (6D vs matrix) is a small −2% lever, whereas
+**baking the wrist rotation directly into absolute keypoint positions** — `camera_node_pose`,
+which places the 24 hand keypoints in the same normalized camera frame as the object cloud —
+does better still (`val/reg` 0.814, the lowest of any single-axis run). The two winning axes
+compose: `best` (`camera_node_pose` + `w_vis=0.25`) reaches **4.16 mm** with the lowest
+`val/reg` (0.805) and FDE (7.35) in the entire sweep. **This is the sweep's headline
+recommendation, and is now the default in `configs/intent.yaml`.**
+
+Note both `cam_hand` and `best` peaked at **epoch 9** (the final epoch), still improving when
+the 10-epoch run stopped — a longer schedule would likely push them lower.
 
 ### Normalization is essential
 
@@ -52,10 +68,15 @@ where MSE gives usable gradients. **Keep `normalize=True`.**
 
 ### Everything else is flat at ~4.3 mm (at the task/label floor)
 
-- **Loss balancing** — `w_vis` 1.0→0.5→0.25: ADE unchanged (4.34/4.33/4.33). The visibility
-  BCE head overfits (`val/vis` climbs) but is *decoupled* from the trajectory head, so
-  down-weighting it cleans up `val/loss` without changing ADE. `reg=huber` is slightly worse
-  (4.48); MSE wins. `w_vis=0.25` is a reasonable default (same ADE, less vis overfitting).
+- **Loss balancing** — `w_vis` 1.0→0.5→0.25→0.0: ADE flat then slightly worse (4.34/4.33/4.33/4.40).
+  The visibility BCE head overfits (`val/vis` climbs) but is *decoupled* from the trajectory head,
+  so down-weighting it cleans up `val/loss` without changing ADE — until `w_vis=0` removes the vis
+  gradient entirely and ADE ticks up to 4.40 with `val/vis` blowing up to 1.70 (the head is
+  untrained). `reg=huber` is slightly worse (4.48); MSE wins. `w_vis=0.25` is the sweet spot: same
+  ADE as baseline, cleanest vis head — adopted in `best`.
+- **EMA decay** — 0.999 (baseline) vs 0.995 vs 0.99: ADE flat (4.34/4.35/4.36). Shorter averaging
+  windows converge to their best epoch faster (best epoch 8→5→3) but **do not lower the ADE floor**
+  — the EMA window is a convergence-speed knob, not an accuracy lever. Keep the 0.999 default.
 - **Horizon** — per-step error is roughly horizon-independent (FDE@4 ≈ 4.8, FDE@8 ≈ 7.6,
   FDE@16 ≈ 11.1; sub-linear growth, no bad error compounding). Horizon is a task choice, not
   an accuracy lever. `t_hist=8` doesn't beat `t_hist=4` — 4 frames already capture the motion cue.
@@ -70,11 +91,14 @@ where MSE gives usable gradients. **Keep `normalize=True`.**
 
 ### Recommended config
 
-Baseline **+ `wrist_repr=matrix`** (the only change that improves ADE), optionally
-**+ `w_vis=0.25`** (free reduction of vis-head overfitting, no ADE cost). Everything else
-stays at the baseline default (`ergonomics`, BiGRU, C=384/depth=6, `t_hist=4`, `t_pred=8`,
-`n_query=16`, `normalize=True`, MSE). A combined confirmation run (`wrist_mat` + `wvis_0.25`)
-is the natural next step before locking the config in.
+**`articulation=camera_node_pose` + `w_vis=0.25`** (the `best` run, 4.16 mm — the lowest ADE,
+`val/reg`, and FDE in the sweep). This is now the default in `configs/intent.yaml`. Note
+`camera_node_pose` supersedes `wrist_repr=matrix`: it captures the wrist frame more effectively
+by placing hand keypoints in the shared normalized camera frame, so the explicit wrist-rotation
+block is dropped (`use_wrist` forced off, `d_q=72`). Everything else stays at the baseline
+default (BiGRU, C=384/depth=6, `t_hist=4`, `t_pred=8`, `n_query=16`, `normalize=True`, MSE,
+EMA 0.999). Since both `cam_hand` and `best` were still improving at epoch 9, a longer run than
+10 epochs is the natural next step.
 
 ### Code fix during the sweep
 
@@ -84,8 +108,3 @@ mismatched. Fixed by removing `point_out` and tying the scene-token width to `cf
 structurally forced to equal `C`). Added `_cfg_from_dict` so checkpoints saved with the old
 `point_out` key still load. `wide` then completed; `small` was re-run after the fix and
 also ties baseline (4.37 mm at 10.6M). **Uncommitted — pending review.**
-| small | C=256, heads=4, depth=4 | **4.37** | 7.57 | 8 | 0.852 | 0.916 | 0.148 | ok |
-| wvis_0 | w_vis=0.0 | **4.40** | 7.67 | 9 | 0.860 | 1.696 | 0.091 | ok |
-| cam_hand | articulation=camera_node_pose | **4.19** | 7.40 | 9 | 0.814 | 1.166 | 0.136 | ok |
-| ema_0.995 | decay=0.995 | **4.35** | 7.59 | 5 | 0.860 | 0.912 | 0.111 | ok |
-| ema_0.99 | decay=0.99 | **4.36** | 7.58 | 3 | 0.862 | 0.811 | 0.111 | ok |

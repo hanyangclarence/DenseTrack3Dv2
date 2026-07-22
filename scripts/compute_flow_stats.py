@@ -48,19 +48,19 @@ from data.flow_window_dataset import FlowWindowDataset
 class Accum:
     """Streaming per-channel mean/std via running count + sum + sum-of-squares."""
 
-    def __init__(self, dim):
+    def __init__(self, dim: int):
         self.n = 0
         self.s = np.zeros(dim, np.float64)
         self.ss = np.zeros(dim, np.float64)
 
-    def add(self, x):
+    def add(self, x: np.ndarray) -> None:
         """x: (M, dim) rows to fold in (NaN rows should be filtered by the caller)."""
         x = x.reshape(-1, self.s.shape[0]).astype(np.float64)
         self.n += x.shape[0]
         self.s += x.sum(0)
         self.ss += (x * x).sum(0)
 
-    def mean_std(self, floor=1e-6):
+    def mean_std(self, floor: float = 1e-6) -> tuple[np.ndarray, np.ndarray]:
         if self.n == 0:
             return np.zeros_like(self.s), np.ones_like(self.s)
         mean = self.s / self.n
@@ -68,7 +68,7 @@ class Accum:
         return mean.astype(np.float32), np.maximum(np.sqrt(var), floor).astype(np.float32)
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = p.add_mutually_exclusive_group()
     src.add_argument("--data-root", default="/home/labeng/yanghan/data/inhand_manipulation",
@@ -86,7 +86,7 @@ def parse_args():
     return p.parse_args()
 
 
-def main():
+def main() -> None:
     args = parse_args()
     if args.episodes_file:
         with open(args.episodes_file) as f:

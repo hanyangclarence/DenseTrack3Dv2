@@ -33,6 +33,7 @@ from lightning.pytorch.cli import LightningCLI
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.flow_window_dataset import FlowWindowDataset
 from densetrack3d.models.worldmodel import IntentModel, IntentModelConfig, intent_loss
+from densetrack3d.models.worldmodel.types import FlowItem, IntentBatch, IntentOutput
 
 
 # --------------------------------------------------------------------------- #
@@ -44,7 +45,7 @@ from densetrack3d.models.worldmodel import IntentModel, IntentModelConfig, inten
 _FLOAT_KEYS = ("cloud", "x0", "target", "q_hist", "q_future", "K", "dxyz_mean", "dxyz_std")
 
 
-def _compute_d_q(articulation, use_wrist, wrist_repr):
+def _compute_d_q(articulation: str, use_wrist: bool, wrist_repr: str) -> int:
     """Hand-feature width the encoder must accept -- mirrors Dataset._hand_features.
 
     articulation dim (ergonomics 20 / raw_node_pose or camera_node_pose 24 keypoints x3 = 72)
@@ -57,7 +58,7 @@ def _compute_d_q(articulation, use_wrist, wrist_repr):
     return art + wr
 
 
-def _cfg_from_dict(d):
+def _cfg_from_dict(d: dict) -> IntentModelConfig:
     """Build an IntentModelConfig from a saved dict, dropping keys the dataclass no longer has.
 
     Old checkpoints (pre point_out removal) carry a `point_out` key; feeding it to
@@ -71,7 +72,7 @@ def _cfg_from_dict(d):
     return IntentModelConfig(**{k: v for k, v in d.items() if k in known})
 
 
-def collate(items):
+def collate(items: list[FlowItem]) -> IntentBatch:
     batch = {}
     for k in _FLOAT_KEYS:
         if k in items[0]:
@@ -90,9 +91,12 @@ def collate(items):
 # --------------------------------------------------------------------------- #
 # LR schedule: linear warmup -> cosine decay to lr_min (spec §6.5)
 # --------------------------------------------------------------------------- #
-def build_scheduler(optimizer, warmup_steps, total_steps, lr_min_ratio):
+def build_scheduler(
+        optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int,
+        lr_min_ratio: float
+        ) -> torch.optim.lr_scheduler.LambdaLR:
     """LambdaLR: linear 0->1 over warmup_steps, then cosine 1->lr_min_ratio."""
-    def fn(step):
+    def fn(step: int) -> float:
         if step < warmup_steps:
             return (step + 1) / max(1, warmup_steps)
         prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
@@ -122,7 +126,7 @@ class EMACallback(pl.Callback):
         self._backup = None       # live state_dict stashed during validation
         self._loaded = None       # shadow state_dict restored from a checkpoint
 
-    def on_fit_start(self, trainer, pl_module):
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         self.shadow = copy.deepcopy(pl_module.model).eval()
         for p in self.shadow.parameters():
             p.requires_grad_(False)
@@ -131,7 +135,9 @@ class EMACallback(pl.Callback):
             self._loaded = None
 
     @torch.no_grad()
-    def on_train_batch_end(self, trainer, pl_module, *args, **kwargs):
+    def on_train_batch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule, *args, **kwargs
+        ) -> None:
         d = self.decay
         for s, p in zip(self.shadow.parameters(), pl_module.model.parameters()):
             s.mul_(d).add_(p, alpha=1 - d)
@@ -139,7 +145,7 @@ class EMACallback(pl.Callback):
             s.copy_(b)                                   # verbatim: running stats already averaged
 
     @torch.no_grad()
-    def on_train_epoch_end(self, trainer, pl_module):
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         # Spec §13 guard WITH TEETH: the copy loop above must keep the shadow's BN running
         # stats in lockstep with the live model. Assert that invariant independently -- if a
         # future edit drops the buffer-copy loop, the live BN stats move off init while the
@@ -151,7 +157,7 @@ class EMACallback(pl.Callback):
                     "EMA shadow buffers diverged from the live model -- the on_train_batch_end "
                     "buffer-copy loop is missing or broken (BN running stats would be lost at eval)")
 
-    def on_validation_start(self, trainer, pl_module):
+    def on_validation_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         # Standalone `trainer.validate --ckpt_path` never calls on_fit_start, so build the
         # shadow lazily from the restored callback state -- else validation would silently
         # run on the RAW weights and its ADE would not match training-time validation.
@@ -164,17 +170,17 @@ class EMACallback(pl.Callback):
         self._backup = {k: v.detach().clone() for k, v in pl_module.model.state_dict().items()}
         pl_module.model.load_state_dict(self.shadow.state_dict())
 
-    def on_validation_end(self, trainer, pl_module):
+    def on_validation_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if self._backup is not None:
             pl_module.model.load_state_dict(self._backup)
             self._backup = None
 
     # persist the shadow in Lightning checkpoints so resume keeps the EMA
-    def state_dict(self):
+    def state_dict(self) -> dict:
         return {"decay": self.decay,
                 "shadow": None if self.shadow is None else self.shadow.state_dict()}
 
-    def load_state_dict(self, sd):
+    def load_state_dict(self, sd: dict) -> None:
         self.decay = sd.get("decay", self.decay)
         self._loaded = sd.get("shadow")                  # applied in on_fit_start
 
@@ -193,14 +199,14 @@ class IntentLitModule(pl.LightningModule):
         self.cfg = model_cfg
         self.model = IntentModel(model_cfg)
 
-    def training_step(self, batch, batch_idx):
+    def training_step(self, batch: IntentBatch, batch_idx: int) -> torch.Tensor:
         out = self.model(batch)
         total, parts = intent_loss(out, batch, w_vis=self.cfg.w_vis, reg=self.cfg.reg)
         self.log_dict({"train/loss": total, "train/reg": parts["reg"], "train/vis": parts["vis"]},
                       prog_bar=True, on_step=True, on_epoch=False, batch_size=batch["cloud"].shape[0])
         return total
 
-    def validation_step(self, batch, batch_idx):
+    def validation_step(self, batch: IntentBatch, batch_idx: int) -> torch.Tensor:
         # EMACallback has swapped the EMA weights into self.model for eval.
         out = self.model(batch)
         total, parts = intent_loss(out, batch, w_vis=self.cfg.w_vis, reg=self.cfg.reg)
@@ -215,7 +221,9 @@ class IntentLitModule(pl.LightningModule):
         return total
 
     @torch.no_grad()
-    def _endpoint_errors(self, batch, out):
+    def _endpoint_errors(
+        self, batch: IntentBatch, out: IntentOutput
+        ) -> tuple[torch.Tensor, torch.Tensor]:
         """Metric-space L2 error over VISIBLE steps: ADE (all steps) + FDE (last step).
 
         predict_trajectory de-standardizes Delta and composes on metric x0; it may slice
@@ -230,7 +238,7 @@ class IntentLitModule(pl.LightningModule):
         fde = (err[:, -1] * m[:, -1]).sum() / m[:, -1].sum().clamp_min(1.0)
         return ade, fde
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> dict:
         # Two-group AdamW: exclude biases, norm affines (BN gamma/beta in SetAbstraction),
         # and positional/embedding tables (step_emb) from weight decay -- decaying those
         # toward zero is a conventional mis-default, not what wd is for.
@@ -273,7 +281,7 @@ class FlowWindowDataModule(pl.LightningDataModule):
         self.train_ds = None
         self.val_ds = None
 
-    def setup(self, stage=None):
+    def setup(self, stage: str = None) -> None:
         if self.train_ds is not None:                       # setup() is called per stage (fit, validate)
             return
         h = self.hparams
@@ -302,23 +310,23 @@ class FlowWindowDataModule(pl.LightningDataModule):
             "(drop_last would empty the loader); lower batch_size or add data"
         print(self.train_ds.coverage_summary())
 
-    def _loader(self, ds, shuffle):
+    def _loader(self, ds: FlowWindowDataset, shuffle: bool) -> DataLoader:
         return DataLoader(ds, batch_size=self.hparams.batch_size, shuffle=shuffle,
                           num_workers=self.hparams.num_workers, collate_fn=collate,
                           persistent_workers=self.hparams.num_workers > 0,
                           pin_memory=True, drop_last=shuffle)
 
-    def train_dataloader(self):
+    def train_dataloader(self) -> DataLoader:
         return self._loader(self.train_ds, shuffle=True)
 
-    def val_dataloader(self):
+    def val_dataloader(self) -> DataLoader:
         return self._loader(self.val_ds, shuffle=False)
 
 
 # --------------------------------------------------------------------------- #
 # Canonical inference loader
 # --------------------------------------------------------------------------- #
-def load_ema_model(ckpt_path, device="cpu"):
+def load_ema_model(ckpt_path: str, device: str = "cpu") -> IntentModel:
     """Load the EMA weights that EARNED a checkpoint's val metric -- the inference entry point.
 
     Lightning saves training state in ckpt["state_dict"] (raw weights) but ranks/names
@@ -350,7 +358,7 @@ def load_ema_model(ckpt_path, device="cpu"):
 # CLI: link data<->model dims so they can't drift, register EMA as a callback
 # --------------------------------------------------------------------------- #
 class IntentCLI(LightningCLI):
-    def add_arguments_to_parser(self, parser):
+    def add_arguments_to_parser(self, parser) -> None:
         parser.add_lightning_class_args(EMACallback, "ema")     # -> trainer.callbacks
         # the dataset is the source of truth for the window shape; the model follows it,
         # so a config can't set n_query=16 on data and 32 on the model (spec §10 shapes).
@@ -366,7 +374,7 @@ class IntentCLI(LightningCLI):
                               "model.model_cfg.d_q", compute_fn=_compute_d_q)
 
 
-def cli_main():
+def cli_main() -> None:
     IntentCLI(model_class=IntentLitModule, datamodule_class=FlowWindowDataModule,
               save_config_kwargs={"overwrite": True})
 

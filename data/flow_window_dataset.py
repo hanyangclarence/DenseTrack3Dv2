@@ -48,6 +48,7 @@ import glob
 import os
 import pickle
 import sys
+from typing import Optional, Union
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -55,9 +56,10 @@ from torch.utils.data import Dataset
 # repo root is the parent of data/ -- allow running as a script (python data/...py)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from preprocess.hand_frame_transforms import wrist_M_rel, placed_hand_camera
+from densetrack3d.models.worldmodel.types import FlowItem
 
 
-def matrix_to_rotation_6d(R):
+def matrix_to_rotation_6d(R: np.ndarray) -> np.ndarray:
     """(..., 3, 3) rotation -> (..., 6): the first two columns, flattened.
 
     The 6D continuous rotation representation (Zhou et al. 2019): drop the third
@@ -66,20 +68,11 @@ def matrix_to_rotation_6d(R):
     return R[..., :, :2].reshape(*R.shape[:-2], 6)
 
 
-def train_eval_split(episodes, val_frac=0.15, seed=0):
-    """Split episodes into (train_eps, eval_eps) BY EPISODE, not by window.
-
-    Windows within one episode overlap heavily (stride_win=1), so splitting at the
-    window level would leak near-identical samples across the boundary. Splitting
-    whole episodes keeps eval genuinely held-out. `episodes` accepts the same forms
-    as the Dataset (episode dirs / a clip / the root); only dirs with a clouds.npz
-    are kept. Deterministic in (resolved episode list, val_frac, seed), so two callers
-    with the same args get complementary partitions. With a single episode, eval is
-    empty (nothing to hold out).
-
-    This is the ONE partition rule; the Dataset's `split=` config calls it, so a
-    `split="train"` Dataset and a `split="eval"` Dataset built with the same root /
-    val_frac / split_seed are exactly complementary."""
+def train_eval_split(
+        episodes: Union[str, list[str]], val_frac: float = 0.15,
+        seed: int = 0
+        ) -> tuple[list[str], list[str]]:
+    """Split episodes into (train_eps, eval_eps) BY EPISODE, not by window."""
     eps = FlowWindowDataset._resolve_episodes(episodes)
     if len(eps) <= 1:
         return eps, []
@@ -100,10 +93,18 @@ class FlowWindowDataset(Dataset):
     index is built once at construction.
     """
 
-    def __init__(self, episodes, *, split="all", val_frac=0.15, split_seed=0,
-                 stride_hz=4, t_pred=8, t_hist=4, pred_pad=0,
-                 n_query=16, min_visible=None, stride_win=1, articulation="ergonomics",
-                 use_wrist=True, wrist_repr="6d", normalize=True, stats=None, seed=0):
+    def __init__(
+            self, episodes: Union[str, list[str]], *, split: str = "all",
+            val_frac: float = 0.15, split_seed: int = 0,
+            stride_hz: int = 4, t_pred: int = 8, t_hist: int = 4, pred_pad: int = 0,
+            n_query: int = 16, min_visible: Optional[int] = None, 
+            stride_win: int = 1,
+            articulation: str = "ergonomics", use_wrist: bool = True, 
+            wrist_repr: str = "6d", 
+            normalize: bool = True,
+            stats: Optional[str] = None,
+            seed: int = 0
+            ):
         """
         episodes     : list of episode dirs, OR a clip dir, OR the dataset root
                        (auto-expanded to all episode_* that have a clouds.npz).
@@ -177,7 +178,7 @@ class FlowWindowDataset(Dataset):
 
     # ------------------------------------------------------------------ setup
     @staticmethod
-    def _resolve_episodes(episodes):
+    def _resolve_episodes(episodes: Union[str, list[str]]) -> list[str]:
         """Accept a list of episode dirs, a single clip dir, or the dataset root."""
         if isinstance(episodes, str):
             episodes = [episodes]
@@ -191,12 +192,12 @@ class FlowWindowDataset(Dataset):
                 out.extend(e for e in eps if os.path.exists(os.path.join(e, "clouds.npz")))
         return out
 
-    def _span(self):
+    def _span(self) -> tuple[int, int]:
         """Native-frame reach on each side of t: (back, forward) inclusive counts."""
         s = self.stride_hz
         return self.t_hist * s, self.l_pred * s
 
-    def _candidate_present_frames(self, ep):
+    def _candidate_present_frames(self, ep: str) -> list[tuple[int, int]]:
         """(t, n_visible) for frames whose window is in bounds and cloud at t is valid.
 
         The min_visible threshold is applied by the caller so it can also count drops."""
@@ -208,7 +209,7 @@ class FlowWindowDataset(Dataset):
         lo, hi = back, Tclip - fwd - 1                         # inclusive present-frame range
         return [(t, int(n_vis[t])) for t in range(lo, hi + 1, self.stride_win) if cloud_ok[t]]
 
-    def coverage_summary(self):
+    def coverage_summary(self) -> str:
         """Sanity report: how many candidate present-frames were dropped for having
         fewer than min_visible tracks, and the distribution of visible-track counts
         among the kept windows (so you can tell whether n_query is comfortably met)."""
@@ -222,8 +223,10 @@ class FlowWindowDataset(Dataset):
                 f"median {pct[3] if len(pct) else '-'}  (n_query={self.n_query}, "
                 f"{int((c < self.n_query).sum())} kept windows need replacement sampling)")
 
-    def _load(self, ep):
-        """Lazy-load + cache one episode's arrays (flow, hand, clouds, intrinsics)."""
+    def _load(self, ep: str) -> dict:
+        """Lazy-load + cache one episode's arrays (flow, hand, clouds, intrinsics).
+
+        Keys: coords/vis/clouds/K/ergo/node/wrist_quat (np.ndarray) + Tclip (int)."""
         if ep in self._ep_cache:
             return self._ep_cache[ep]
         with open(os.path.join(ep, "object_flow.pkl"), "rb") as f:
@@ -247,10 +250,10 @@ class FlowWindowDataset(Dataset):
         return arrs
 
     # ------------------------------------------------------------------ access
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.index)
 
-    def _frame_grid(self, t):
+    def _frame_grid(self, t: int) -> tuple[np.ndarray, np.ndarray]:
         """Decimated native-frame indices for history and prediction, anchored at t.
 
         Returns (hist_frames [T_hist], pred_frames [L_pred]). History is the T_hist
@@ -261,7 +264,7 @@ class FlowWindowDataset(Dataset):
         pred = [t + (k + 1) * s for k in range(self.l_pred)]             # t+s, t+2s, ...
         return np.asarray(hist, dtype=np.int64), np.asarray(pred, dtype=np.int64)
 
-    def _hand_features(self, arrs, t, frames):
+    def _hand_features(self, arrs: dict, t: int, frames: np.ndarray) -> np.ndarray:
         """Assemble (len(frames), d_q) hand features for the given native frames.
 
         articulation (ergonomics / raw_node_pose / camera_node_pose) optionally concatenated
@@ -302,7 +305,7 @@ class FlowWindowDataset(Dataset):
             else M.reshape(len(frames), 9)                             # left raw (bounded)
         return np.concatenate([art, wr.astype(np.float32)], axis=1)     # (F, d_q)
 
-    def __getitem__(self, i):
+    def __getitem__(self, i: int) -> FlowItem:
         ei, t = self.index[i]
         ep = self.episodes[ei]
         arrs = self._load(ep)
