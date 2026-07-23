@@ -7,8 +7,6 @@ Everything is driven from a YAML config via LightningCLI:
 
   /home/labeng/miniconda3/envs/densetrack3d/bin/python scripts/train_intent.py fit \
       --config configs/intent.yaml
-  # gate 3 (overfit one clip):  ... fit --config configs/intent.yaml --data.overfit_one_clip true \
-  #                                 --data.clip <episode_or_clip_dir>
 
 Pieces this ties together (all already built):
   - data   : data/flow_window_dataset.FlowWindowDataset  (+ episode-level split)
@@ -204,9 +202,7 @@ class IntentLitModule(pl.LightningModule):
         total, parts = intent_loss(out, batch, w_vis=self.cfg.w_vis, reg=self.cfg.reg)
         ade, fde = self._endpoint_errors(batch, out)
         bs = batch["cloud"].shape[0]
-        # ade/fde are per-visible-step means WITHIN a batch; the epoch value is a batch-size-
-        # weighted mean-of-means (on_epoch=True), not a global per-step mean. Negligible at
-        # fixed batch size with drop_last=False on val -- expect third-decimal wiggle only.
+        # ade/fde are per-visible-step means WITHIN a batch
         self.log_dict({"val/loss": total, "val/reg": parts["reg"], "val/vis": parts["vis"],
                        "val/ade_m": ade, "val/fde_m": fde},
                       prog_bar=True, on_step=False, on_epoch=True, batch_size=bs)
@@ -232,8 +228,7 @@ class IntentLitModule(pl.LightningModule):
 
     def configure_optimizers(self) -> dict:
         # Two-group AdamW: exclude biases, norm affines (BN gamma/beta in SetAbstraction),
-        # and positional/embedding tables (step_emb) from weight decay -- decaying those
-        # toward zero is a conventional mis-default, not what wd is for.
+        # and positional/embedding tables (step_emb) from weight decay
         decay, no_decay = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:
@@ -262,12 +257,12 @@ class FlowWindowDataModule(pl.LightningDataModule):
     """Episode-level train/eval split over precomputed windows (spec §5.2)."""
 
     def __init__(self, data_root: str = "/home/labeng/yanghan/data/inhand_manipulation",
-                 clip: str = None, stats: str = "data/flow_stats.npz",
+                 stats: str = "data/flow_stats.npz",
                  stride_hz: int = 4, t_pred: int = 8, t_hist: int = 4, pred_pad: int = 0,
                  n_query: int = 16, val_frac: float = 0.15, split_seed: int = 0,
-                 batch_size: int = 16, num_workers: int = 4, overfit_one_clip: bool = False,
+                 batch_size: int = 16, num_workers: int = 4,
                  articulation: str = "ergonomics", use_wrist: bool = True,
-                 wrist_repr: str = "6d"):
+                 wrist_repr: str = "6d", aug_joint_deg: float = 0.0):
         super().__init__()
         self.save_hyperparameters()
         self.train_ds = None
@@ -280,20 +275,21 @@ class FlowWindowDataModule(pl.LightningDataModule):
         # dxyz stats are rate-specific; a stride_hz mismatch silently mis-scales the target.
         assert int(np.load(h.stats)["stride_hz"]) == h.stride_hz, \
             f"stats stride_hz != {h.stride_hz}; recompute flow_stats with --stride-hz {h.stride_hz}"
-        source = h.clip or h.data_root
         common = dict(stats=h.stats, stride_hz=h.stride_hz,
                       t_pred=h.t_pred, t_hist=h.t_hist, pred_pad=h.pred_pad, n_query=h.n_query,
                       articulation=h.articulation, use_wrist=h.use_wrist,
                       wrist_repr=h.wrist_repr)
-        if h.overfit_one_clip:                              # gate 3: memorize one clip, no held-out
-            assert h.clip is not None, \
-                "overfit_one_clip=True needs --data.clip <dir>; else it overfits the WHOLE dataset"
-            self.train_ds = FlowWindowDataset(source, split="all", **common)
-            self.val_ds = self.train_ds
-        else:
-            split = dict(val_frac=h.val_frac, split_seed=h.split_seed)
-            self.train_ds = FlowWindowDataset(source, split="train", **common, **split)
-            self.val_ds = FlowWindowDataset(source, split="eval", **common, **split)
+        split = dict(val_frac=h.val_frac, split_seed=h.split_seed)
+        self.train_ds = FlowWindowDataset(
+            h.data_root, split="train",
+            aug_joint_deg=h.aug_joint_deg, 
+            **common, **split
+            )
+        self.val_ds = FlowWindowDataset(
+            h.data_root, split="eval",
+            aug_joint_deg=0.0, 
+            **common, **split
+            )
         # train loader uses drop_last=True; fewer windows than a batch -> silently empty loader.
         assert len(self.train_ds) >= h.batch_size, \
             f"train set has {len(self.train_ds)} windows < batch_size={h.batch_size} " \

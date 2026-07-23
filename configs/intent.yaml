@@ -8,7 +8,6 @@ seed_everything: 0
 
 data:
   data_root: /home/labeng/yanghan/data/inhand_manipulation
-  clip: null                 # set (with overfit_one_clip: true) to run gate 3 on one clip
   stats: data/flow_stats.npz
   stride_hz: 4               # must match the stats file's stride_hz
   t_pred: 8
@@ -16,11 +15,11 @@ data:
   pred_pad: 0
   n_query: 16
   articulation: camera_node_pose
+  aug_joint_deg: 10.0         # train-only grasp reshape
   val_frac: 0.15
   split_seed: 0
   batch_size: 256
   num_workers: 8             # B=256 loads 16x more windows/batch; 4 starves the GPU
-  overfit_one_clip: false
 
 model:
   lr: 4.0e-4                   # sqrt-scaled for B=256 (sqrt(16)*1e-4); AdamW, with warmup+clip

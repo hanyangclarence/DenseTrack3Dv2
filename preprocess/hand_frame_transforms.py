@@ -162,3 +162,123 @@ def wrist_frame_flow(coords_cam: np.ndarray, wrist_quat: np.ndarray, anchor: int
     coords_P = transform_cloud_to_P(coords_cam)
     M_rel = wrist_M_rel(wrist_quat, anchor=anchor)
     return stabilized_cloud_P(coords_P, M_rel)
+
+
+# ============================ JOINT-JITTER AUGMENTATION ======================
+# Helpers for reshaping the Manus skeleton into a plausible alternate grasp by
+# perturbing each 1-DOF revolute joint about its own (data-recovered) axis. The
+# skeleton is a rigid-bone tree (bone lengths constant over time) and every moving
+# joint spins about a fixed parent-local axis, so a delta angle is a proper,
+# bone-preserving re-pose. See docs/superpowers/specs/2026-07-22-hand-joint-jitter-*.
+
+# Policy: joints we deliberately do NOT jitter, even though they move. These are the
+# root-closest (MCP knuckle) joints of index/middle/ring/pinky -- nodes 5,10,15,20, the
+# first node of each of those finger chains. Perturbing them swings the whole finger from
+# the knuckle (finger splay / palm arch), which reshapes the hand's gross posture rather
+# than the grasp curl we want to augment; the thumb MCP (node 1) is kept. recover_joint_axes
+# drops these from has_dof so BOTH the training dataset and viz_aug_skeletons inherit the
+# exclusion from this one place (both gate their per-joint draw on has_dof only).
+AUG_EXCLUDE_NODES = (5, 10, 15, 20)
+
+def quats_to_R(q: np.ndarray) -> np.ndarray:
+    """Batched quaternion (x, y, z, w) -> rotation. q: (..., 4) -> (..., 3, 3).
+
+    Zero-norm quaternions map to identity (matches quat_to_R)."""
+    q = np.asarray(q, dtype=np.float64)
+    x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    n = x * x + y * y + z * z + w * w
+    s = np.where(n < 1e-12, 0.0, 2.0 / n)               # s=0 -> identity below
+    R = np.empty(q.shape[:-1] + (3, 3), dtype=np.float64)
+    R[..., 0, 0] = 1 - (y * y + z * z) * s; R[..., 0, 1] = (x * y - w * z) * s; R[..., 0, 2] = (x * z + w * y) * s
+    R[..., 1, 0] = (x * y + w * z) * s;     R[..., 1, 1] = 1 - (x * x + z * z) * s; R[..., 1, 2] = (y * z - w * x) * s
+    R[..., 2, 0] = (x * z - w * y) * s;     R[..., 2, 1] = (y * z + w * x) * s;     R[..., 2, 2] = 1 - (x * x + y * y) * s
+    return R
+
+
+def rot_about_axis(axis: np.ndarray, theta: np.ndarray) -> np.ndarray:
+    """Rodrigues rotation about a (per-row) axis by theta radians.
+
+    axis: (M, 3), need not be unit; a zero-length axis yields identity for any theta.
+    theta: (M,). Returns (M, 3, 3)."""
+    axis = np.asarray(axis, dtype=np.float64).reshape(-1, 3)
+    theta = np.asarray(theta, dtype=np.float64).reshape(-1)
+    norm = np.linalg.norm(axis, axis=1, keepdims=True)
+    u = np.where(norm < 1e-12, 0.0, axis / np.where(norm < 1e-12, 1.0, norm))  # (M,3), 0 for zero axis
+    M = axis.shape[0]
+    K = np.zeros((M, 3, 3))
+    K[:, 0, 1], K[:, 0, 2] = -u[:, 2], u[:, 1]
+    K[:, 1, 0], K[:, 1, 2] = u[:, 2], -u[:, 0]
+    K[:, 2, 0], K[:, 2, 1] = -u[:, 1], u[:, 0]
+    s, c = np.sin(theta)[:, None, None], np.cos(theta)[:, None, None]
+    return np.eye(3)[None] + s * K + (1 - c) * (K @ K)  # zero K (zero axis) -> identity
+
+
+def recover_joint_axes(node_quat: np.ndarray, parent: np.ndarray,
+                       min_deg: float = 3.0, min_frames: int = 20
+                       ) -> tuple[np.ndarray, np.ndarray]:
+    """Recover each joint's fixed parent-local revolute axis from its own motion.
+
+    node_quat: (T, 25, 4) per-frame node orientations (x, y, z, w).
+    parent:    (25,) parent index per node (root's parent is itself / 0).
+    A joint's parent-relative rotation R_rel(t) = R(q_parent)^T R(q_child) spins about a
+    fixed axis; we average the per-frame axis over frames with angle > min_deg. Joints with
+    fewer than min_frames active frames (tips / coupled joints) get has_dof=False. Joints in
+    AUG_EXCLUDE_NODES (index/middle/ring/pinky MCP knuckles) are also forced has_dof=False by
+    policy -- we do not want to jitter finger splay, only grasp curl.
+    Returns axes (25, 3) (unit rows where has_dof, zero rows otherwise) and has_dof (25,) bool."""
+    node_quat = np.asarray(node_quat, dtype=np.float64)
+    Rn = quats_to_R(node_quat)                          # (T,25,3,3)
+    axes = np.zeros((25, 3)); has_dof = np.zeros(25, dtype=bool)
+    thr = np.deg2rad(min_deg)
+    for j in range(1, 25):
+        if j in AUG_EXCLUDE_NODES:                      # policy exclusion (see AUG_EXCLUDE_NODES)
+            continue
+        p = int(parent[j])
+        Rp, Rj = Rn[:, p], Rn[:, j]                     # (T,3,3)
+        Rrel = np.einsum("tij,tjk->tik", np.transpose(Rp, (0, 2, 1)), Rj)  # Rp^T Rj
+        tr = np.clip((np.trace(Rrel, axis1=1, axis2=2) - 1.0) / 2.0, -1.0, 1.0)
+        ang = np.arccos(tr)                             # (T,)
+        ax = np.stack([Rrel[:, 2, 1] - Rrel[:, 1, 2],
+                       Rrel[:, 0, 2] - Rrel[:, 2, 0],
+                       Rrel[:, 1, 0] - Rrel[:, 0, 1]], axis=-1)             # (T,3), = 2 sin(ang) u
+        m = ang > thr
+        if int(m.sum()) < min_frames:
+            continue
+        u = ax[m] / (2.0 * np.sin(ang[m]))[:, None]     # unit axis per active frame
+        ref = u[0]
+        sgn = np.sign(u @ ref); sgn[sgn == 0] = 1.0     # hemisphere-align before averaging
+        um = (u * sgn[:, None]).mean(0)
+        nn = np.linalg.norm(um)
+        if nn < 1e-6:
+            continue
+        axes[j] = um / nn; has_dof[j] = True
+    return axes, has_dof
+
+
+def repose_skeleton(node_pos: np.ndarray, node_quat: np.ndarray, parent: np.ndarray,
+                    axes: np.ndarray, dtheta_rad: np.ndarray) -> np.ndarray:
+    """Re-pose the rigid-bone skeleton by adding a per-joint delta about each joint's axis.
+
+    Forward kinematics per frame, parent-before-child (node order is topologically sorted):
+      R_rel'(j) = R_rel(j) @ rot_about_axis(axes[j], dtheta[j]);  A_j = A_parent @ R_rel'(j);
+      p_j = p_parent + A_parent @ b_j,  where b_j = R(q_parent)^T (pos_j - pos_parent) (rigid bone).
+    With dtheta_rad all-zero this telescopes back to the recorded positions exactly.
+
+    node_pos: (F, 25, 3) absolute wrist-frame positions. node_quat: (F, 25, 4).
+    parent: (25,). axes: (25, 3). dtheta_rad: (25,). Returns (F, 25, 3)."""
+    node_pos = np.asarray(node_pos, dtype=np.float64)
+    Rn = quats_to_R(np.asarray(node_quat, dtype=np.float64))   # (F,25,3,3)
+    F = node_pos.shape[0]
+    dR = rot_about_axis(axes, dtheta_rad)                       # (25,3,3), identity where dtheta=0
+    A = np.zeros((F, 25, 3, 3)); p = np.zeros((F, 25, 3))
+    A[:, 0] = np.eye(3); p[:, 0] = node_pos[:, 0]               # root anchor (wrist at origin)
+    for j in range(1, 25):
+        par = int(parent[j])
+        Rp = Rn[:, par]                                         # (F,3,3)
+        RpT = np.transpose(Rp, (0, 2, 1))
+        Rrel = np.einsum("fij,fjk->fik", RpT, Rn[:, j])         # Rp^T Rj
+        Rrel_p = np.einsum("fij,jk->fik", Rrel, dR[j])          # inject delta about joint axis
+        A[:, j] = np.einsum("fij,fjk->fik", A[:, par], Rrel_p)
+        b = np.einsum("fij,fj->fi", RpT, node_pos[:, j] - node_pos[:, par])  # rigid bone, parent-local
+        p[:, j] = p[:, par] + np.einsum("fij,fj->fi", A[:, par], b)
+    return p

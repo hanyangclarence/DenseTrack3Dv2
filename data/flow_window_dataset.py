@@ -55,7 +55,9 @@ from torch.utils.data import Dataset
 
 # repo root is the parent of data/ -- allow running as a script (python data/...py)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from preprocess.hand_frame_transforms import wrist_M_rel, placed_hand_camera
+from preprocess.hand_frame_transforms import (
+    wrist_M_rel, placed_hand_camera, recover_joint_axes, repose_skeleton,
+)
 from densetrack3d.models.worldmodel.types import FlowItem
 
 
@@ -99,8 +101,9 @@ class FlowWindowDataset(Dataset):
             stride_hz: int = 4, t_pred: int = 8, t_hist: int = 4, pred_pad: int = 0,
             n_query: int = 16, min_visible: Optional[int] = None, 
             stride_win: int = 1,
-            articulation: str = "ergonomics", use_wrist: bool = True, 
-            wrist_repr: str = "6d", 
+            articulation: str = "ergonomics", use_wrist: bool = True,
+            wrist_repr: str = "6d",
+            aug_joint_deg: float = 0.0,
             normalize: bool = True,
             stats: Optional[str] = None,
             seed: int = 0
@@ -122,6 +125,7 @@ class FlowWindowDataset(Dataset):
                        or "camera_node_pose" (24 keypoints x 3 = 72 in the CAMERA frame)
         use_wrist    : append the anchor-relative wrist rotation M_rel to each frame.
         wrist_repr   : "6d" (default) or "matrix" (9) -- ignored when use_wrist=False.
+        aug_joint_deg: joint degree augmentation, applied to node_pose observation
         normalize    : normalize=False should only be in scripts/compute_flow_stats.py
         stats        : path to the .npz written by scripts/compute_flow_stats.py
         seed         : base RNG seed (per-item seeds are derived so sampling is stable).
@@ -145,6 +149,9 @@ class FlowWindowDataset(Dataset):
         self.articulation = articulation
         self.use_wrist = bool(use_wrist)
         self.wrist_repr = wrist_repr
+        self.aug_joint_deg = float(aug_joint_deg)
+        assert not (self.aug_joint_deg > 0.0 and articulation == "ergonomics"), \
+            "aug_joint_deg>0 needs a skeleton (camera_node_pose/raw_node_pose), not ergonomics"
         self.normalize = bool(normalize)
         self.seed = int(seed)
         self._stats = dict(np.load(stats)) if stats is not None else None
@@ -224,7 +231,7 @@ class FlowWindowDataset(Dataset):
     def _load(self, ep: str) -> dict:
         """Lazy-load + cache one episode's arrays (flow, hand, clouds, intrinsics).
 
-        Keys: coords/vis/clouds/K/ergo/node/wrist_quat (np.ndarray) + Tclip (int)."""
+        Keys: coords/vis/clouds/K/ergo/node/wrist_quat/parent/axes/has_dof + Tclip (int)."""
         if ep in self._ep_cache:
             return self._ep_cache[ep]
         with open(os.path.join(ep, "object_flow.pkl"), "rb") as f:
@@ -242,8 +249,13 @@ class FlowWindowDataset(Dataset):
         wrist_quat = np.asarray(hand["wrist_quat"], dtype=np.float32)  # (T, 4) xyzw
         # One shared frame count across every modality (all index-aligned, spec §2.3).
         Tclip = min(coords.shape[0], clouds.shape[0], ergo.shape[0])
+        parent = np.asarray(hand["raw_node_parent"])                   # (25,) kinematic tree
+        # revolute axis per joint, recovered once from this episode's motion (cheap, cached).
+        axes, has_dof = recover_joint_axes(node[..., 3:], parent) \
+            if self.aug_joint_deg > 0.0 else (np.zeros((25, 3)), np.zeros(25, bool))
         arrs = dict(coords=coords, vis=vis, clouds=clouds, K=K, ergo=ergo,
-                    node=node, wrist_quat=wrist_quat, Tclip=Tclip)
+                    node=node, wrist_quat=wrist_quat, parent=parent,
+                    axes=axes, has_dof=has_dof, Tclip=Tclip)
         self._ep_cache[ep] = arrs
         return arrs
 
@@ -262,7 +274,8 @@ class FlowWindowDataset(Dataset):
         pred = [t + (k + 1) * s for k in range(self.l_pred)]             # t+s, t+2s, ...
         return np.asarray(hist, dtype=np.int64), np.asarray(pred, dtype=np.int64)
 
-    def _hand_features(self, arrs: dict, t: int, frames: np.ndarray) -> np.ndarray:
+    def _hand_features(self, arrs: dict, t: int, frames: np.ndarray,
+                       node_pos: Optional[np.ndarray] = None) -> np.ndarray:
         """Assemble (len(frames), d_q) hand features for the given native frames.
 
         articulation (ergonomics / raw_node_pose / camera_node_pose) optionally concatenated
@@ -274,10 +287,13 @@ class FlowWindowDataset(Dataset):
         - camera_node_pose : (72) keypoints 1..24 placed in the CAMERA frame (M_rel anchored at
                              t, then P->camera)
         """
+        # node_pos, when given, is a (len(frames), 25, 3) re-posed skeleton for exactly `frames`
+        # (augmentation); otherwise the recorded arrs["node"][frames] positions are used.
         if self.articulation == "camera_node_pose":
             idx = np.concatenate([[t], frames])                         # anchor first
             M = wrist_M_rel(arrs["wrist_quat"][idx], anchor=0)[1:]      # (F, 3, 3), rel to t
-            node = arrs["node"][frames, :, :3].astype(np.float64)      # (F, 25, 3) local, node0=origin
+            node = (arrs["node"][frames, :, :3] if node_pos is None
+                    else node_pos).astype(np.float64)                  # (F, 25, 3) local, node0=origin
             kp_cam = placed_hand_camera(node, M)[:, 1:]                # (F, 24, 3) camera; drop const wrist
             art = kp_cam.reshape(len(frames), -1).astype(np.float32)   # (F, 72)
             if self.normalize:                                         # SAME transform as the cloud
@@ -290,7 +306,8 @@ class FlowWindowDataset(Dataset):
             art = arrs["ergo"][frames].astype(np.float32)                # (F, 20) deg
             key = "ergo"
         else:
-            art = arrs["node"][frames, 1:, :3].reshape(len(frames), -1).astype(np.float32)  # (F, 72) m
+            src = arrs["node"][frames, 1:, :3] if node_pos is None else node_pos[:, 1:]
+            art = src.reshape(len(frames), -1).astype(np.float32)      # (F, 72) m
             key = "node"
         if self.normalize:                                              # articulation only
             art = (art - self._stats[f"{key}_mean"]) / self._stats[f"{key}_std"]
@@ -326,8 +343,21 @@ class FlowWindowDataset(Dataset):
             cloud = (cloud - self._stats["cloud_mean"]) / self._stats["cloud_scale"]
 
         # --- hand: history (cue) + future (action) ---------------------------------
-        q_hist = self._hand_features(arrs, t, hist_f)                  # (T_hist, d_q)
-        q_future = self._hand_features(arrs, t, pred_f)                # (L_pred, d_q)
+        # Augmentation (train only): one constant per-joint angle delta for the whole window,
+        # re-posing the skeleton about each revolute joint's axis. Object side is untouched.
+        hp = pp = None
+        if self.aug_joint_deg > 0.0:
+            dtheta = np.zeros(25)
+            dof = arrs["has_dof"]
+            dtheta[dof] = rng.uniform(-self.aug_joint_deg, self.aug_joint_deg, int(dof.sum()))
+            dtheta = np.deg2rad(dtheta)
+            node = arrs["node"]
+            hp = repose_skeleton(node[hist_f, :, :3], node[hist_f, :, 3:],
+                                 arrs["parent"], arrs["axes"], dtheta)   # (T_hist,25,3)
+            pp = repose_skeleton(node[pred_f, :, :3], node[pred_f, :, 3:],
+                                 arrs["parent"], arrs["axes"], dtheta)   # (L_pred,25,3)
+        q_hist = self._hand_features(arrs, t, hist_f, node_pos=hp)     # (T_hist, d_q)
+        q_future = self._hand_features(arrs, t, pred_f, node_pos=pp)   # (L_pred, d_q)
 
         item = dict(
             cloud=cloud.astype(np.float32),
