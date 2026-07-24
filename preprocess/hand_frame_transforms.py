@@ -1,3 +1,7 @@
+# VENDORED COPY. The CANONICAL version lives in the intent-model repo at
+# data/hand_frame_transforms.py. This copy exists only for preprocess/viz_hand_cloud_live.py.
+# If you change the transforms, update the canonical copy in intent-model too (must match:
+# the intent model trains on placed_hand_camera from the canonical copy).
 #!/usr/bin/env python3
 """Shared coordinate transforms: Manus hand + object cloud -> Genesis frame P.
 
@@ -138,15 +142,23 @@ def placed_hand_P(node_pos: np.ndarray, M_rel: np.ndarray) -> np.ndarray:
     return np.einsum("ij,tjk,tnk->tni", G, M_rel, node_pos)
 
 
-def placed_hand_camera(node_pos: np.ndarray, M_rel: np.ndarray) -> np.ndarray:
+def placed_hand_camera(node_pos: np.ndarray, M_rel: np.ndarray,
+                       delta_R: np.ndarray = None, delta_t: np.ndarray = None) -> np.ndarray:
     """Full moving hand in CAMERA-OPTICAL frame: (P placement) then P -> camera.
 
     Places the raw hand-local skeleton into P exactly as placed_hand_P, then maps back to the camera-optical
     frame so the keypoints share ONE frame with the object cloud / query points
 
     node_pos: (T, 25, 3) raw hand-local skeleton. M_rel: (T, 3, 3) anchored wrist rotation.
+    delta_R:  (3, 3) optional rigid rotation applied about the WRIST. None = identity.
+    delta_t:  (3,) optional rigid translation (metres, in P) added to the mount offset. None = zero.
     Returns (T, 25, 3) in camera-optical metres (same frame as object_flow.pkl coords)."""
-    hand_P = placed_hand_P(node_pos, M_rel) + T_HAND_TO_P    # (T,25,3) in P
+    hand_P = placed_hand_P(node_pos, M_rel)                  # (T,25,3) in P, node0 at origin
+    if delta_R is not None:                                  # rigid rotation about the wrist origin
+        hand_P = np.einsum("ij,tnj->tni", delta_R, hand_P)
+    hand_P = hand_P + T_HAND_TO_P
+    if delta_t is not None:                                  # rigid mount translation
+        hand_P = hand_P + delta_t
     shp = hand_P.shape
     flat = hand_P.reshape(-1, 3)
     homo = np.concatenate([flat, np.ones((flat.shape[0], 1))], axis=1)
@@ -211,6 +223,24 @@ def rot_about_axis(axis: np.ndarray, theta: np.ndarray) -> np.ndarray:
     K[:, 2, 0], K[:, 2, 1] = -u[:, 1], u[:, 0]
     s, c = np.sin(theta)[:, None, None], np.cos(theta)[:, None, None]
     return np.eye(3)[None] + s * K + (1 - c) * (K @ K)  # zero K (zero axis) -> identity
+
+
+def random_wrist_delta(rng, deg: float, trans_m: float) -> tuple[np.ndarray, np.ndarray]:
+    """Draw one small rigid (delta_R, delta_t) for a hand->camera placement augmentation.
+
+    rng:     a numpy Generator (np.random.default_rng); all draws come from it so callers
+             control determinism / RNG ordering.
+    deg:     rotation magnitude bound -- angle ~ U(-deg, +deg) about a uniformly-random unit axis.
+    trans_m: translation bound -- each of delta_t's 3 components ~ U(-trans_m, +trans_m) metres.
+    Returns (delta_R (3,3), delta_t (3,)) suitable for placed_hand_camera. With deg=0 and
+    trans_m=0 this returns (I, 0) exactly (rot_about_axis of 0 is identity)."""
+    v = rng.standard_normal(3)                              # uniform-on-sphere axis (direction only)
+    n = np.linalg.norm(v)
+    axis = v / n if n > 1e-12 else np.array([1.0, 0.0, 0.0])
+    angle = np.deg2rad(rng.uniform(-deg, deg))
+    delta_R = rot_about_axis(axis[None], np.array([angle]))[0]   # (3,3)
+    delta_t = rng.uniform(-trans_m, trans_m, 3)
+    return delta_R, delta_t
 
 
 def recover_joint_axes(node_quat: np.ndarray, parent: np.ndarray,
