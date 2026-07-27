@@ -162,6 +162,15 @@ python3 visualizer/vis_open3d.py --filepath results/yellow-duck/dense_3d_track.p
 python3 visualizer/vis_open3d.py --filepath results/yellow-duck/dense_3d_track.pkl --fg_mask_path demo_data/yellow-duck/yellow-duck_mask.png --video_name yellow-duck --mode capture
 ```
 
+### Real-time glove evaluation
+
+Start the Manus publisher (in `dag-ros-workspace/dagger-orchestration`), then launch the live viewer:
+
+```bash
+uv run dag launch --services manus_publisher   # producer (separate terminal)
+bash scripts/launch_realtime.sh --ckpt logdirs/intent/ckpts/best.ckpt   # in the intent-model repo
+```
+
 ### Prepare training & evaluation data
 Please follow the instructions [here](data/DATA_PREPARATION.md) to prepare the training & evaluation data
 
