@@ -8,15 +8,16 @@
 # Turns one mcap into a self-contained training folder (mcap no longer needed):
 #   color.mp4  depth.mkv  intrinsics.txt  hand.pkl  object_flow.pkl  [object_flow_2d.mp4]
 #
+# All five stages live in THIS repo; Grounded-SAM-2 is vendored under submodules/.
 # Stage 1 (track4world): extract color.mp4 + lossless depth.mkv from the mcap,
 #   horizontally center-cropped to --crop-width (keeps the interaction region only);
 #   the crop-adjusted intrinsics are written to intrinsics.txt and used downstream.
 # Stage 2 (track4world): extract the Manus glove readout + retargeted hand joints
 #   (active --side, default left), aligned to the camera frames -> hand.pkl.
 # Stage 3 (track4world): Grounded-DINO + SAM2 segmentation of the prompted object.
-#   Only every STRIDE-th frame is segmented -- the windowed tracker seeds masks
-#   only at its window starts (multiples of STRIDE), so intermediate masks would
-#   be discarded. This cuts the pipeline's slowest stage ~STRIDE-fold. Only the
+#   Every frame is segmented (--frame-stride 1): the windowed tracker only needs
+#   masks at its window starts, but scripts/gen_flow_labels.py back-projects one
+#   object cloud PER FRAME and so needs them dense. Only the
 #   single highest-confidence detection is kept per frame (--max-detections 1),
 #   since each clip tracks exactly one goal object. "hand. glove." are given as
 #   negative prompts (--exclude-prompt) so the manipulator matches its own label
@@ -28,8 +29,7 @@ set -euo pipefail
 
 # --- fixed config -----------------------------------------------------------
 REPO="/home/labeng/yanghan/code/vision/DenseTrack3Dv2"
-TRACK4WORLD_REPO="/home/labeng/yanghan/code/vision/Track4World"
-SAM2_CKPT="checkpoints/sam2.1_hiera_large.pt"          # relative to TRACK4WORLD_REPO
+SAM2_CKPT="$REPO/checkpoints/sam2.1_hiera_large.pt"    # vendored Grounded-SAM-2 weights
 INTRINSICS="771.59,771.365,645.555,349.653"            # ZED @ 1280x720 (source)
 DEPTH_SCALE=1000.0
 FPS=30.0
@@ -93,14 +93,14 @@ fi
 # --- Stage 3: segmentation --------------------------------------------------
 banner "STAGE 3/5  segmentation ('$PROMPT')"
 if [[ $FORCE -eq 1 || ! -d "$OUTDIR/seg/mask" ]]; then
-  ( cd "$TRACK4WORLD_REPO" && conda run -n track4world --no-capture-output python scripts/run_dino_sam2.py \
-      --video-path "$OUTDIR/color.mp4" \
-      --text-prompt "$PROMPT" \
-      --sam2-checkpoint "$SAM2_CKPT" \
-      --output-dir "$OUTDIR/seg" \
-      --frame-stride 1 \
-      --max-detections 1 \
-      --exclude-prompt "hand. glove." )
+  conda run -n track4world --no-capture-output python "$REPO/preprocess/run_dino_sam2.py" \
+    --video-path "$OUTDIR/color.mp4" \
+    --text-prompt "$PROMPT" \
+    --sam2-checkpoint "$SAM2_CKPT" \
+    --output-dir "$OUTDIR/seg" \
+    --frame-stride 1 \
+    --max-detections 1 \
+    --exclude-prompt "hand. glove."
 else
   echo "skip: $OUTDIR/seg/mask already exists (use --force to redo)"
 fi
